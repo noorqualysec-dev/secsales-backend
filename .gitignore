@@ -1,0 +1,6 @@
+.env
+node_modules
+dist
+
+secscales-29c94-firebase-adminsdk-fbsvc-d87e04623f.json
+*firebase-adminsdk*.json
