@@ -59,7 +59,7 @@ import productivityRoutes from "./routes/productivityRoutes.js";
 import adminRoutes from "./routes/adminRoutes.js";
 
 // Firebase initialization
-import "./config/firebase.js";
+// import "./config/firebase.js";
 
 const app = express();
 
