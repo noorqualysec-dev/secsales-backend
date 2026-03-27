@@ -64,23 +64,66 @@ import "./config/firebase.js";
 const app = express();
 
 // Enable CORS
-const allowedOrigins = [
-    "http://localhost:3000",
-    "http://localhost:3001",
-    "http://localhost:4200",
-    "https://secsales.vercel.app",
-    process.env.FRONTEND_URL,           // set this in Vercel env vars
-].filter(Boolean) as string[];
+// const allowedOrigins = [
+//     "http://localhost:3000",
+//     "http://localhost:3001",
+//     "http://localhost:4200",
+//     "https://secsales.vercel.app",
+//     process.env.FRONTEND_URL,           // set this in Vercel env vars
+// ].filter(Boolean) as string[];
 
-app.use(cors({
-    origin: allowedOrigins,
+// app.use(cors({
+//     origin: allowedOrigins,
+//     credentials: true,
+//     methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+//     allowedHeaders: ["Content-Type", "Authorization"],
+// }));
+const allowedOrigins = [
+  "http://localhost:3000",
+  "http://localhost:3001",
+  "http://localhost:4200",
+  "https://secsales.vercel.app",
+  process.env.FRONTEND_URL,
+].filter(Boolean);
+
+app.use(
+  cors({
+    origin: (origin, callback) => {
+      if (!origin) return callback(null, true); // allow postman / mobile
+
+      if (allowedOrigins.includes(origin)) {
+        return callback(null, true);
+      }
+
+      console.log("❌ Blocked by CORS:", origin);
+      return callback(new Error("Not allowed by CORS"));
+    },
     credentials: true,
     methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization"],
-}));
+  })
+);
+
+app.use((req, res, next) => {
+  res.setHeader(
+    "Access-Control-Allow-Origin",
+    "https://secsales.vercel.app"
+  );
+  res.setHeader(
+    "Access-Control-Allow-Headers",
+    "Origin, X-Requested-With, Content-Type, Accept, Authorization"
+  );
+  res.setHeader(
+    "Access-Control-Allow-Methods",
+    "GET, POST, PUT, PATCH, DELETE, OPTIONS"
+  );
+  next();
+});
 
 // ✅ 2. HANDLE PREFLIGHT (ADD HERE)
-app.options("*", cors());
+app.options("*", (req, res) => {
+  res.status(200).end();
+});
 
 // Middleware
 app.use(express.json());
