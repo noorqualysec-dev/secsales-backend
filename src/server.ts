@@ -103,25 +103,25 @@ const app = express();
 //     allowedHeaders: ["Content-Type", "Authorization"],
 //   })
 // );
-const allowedOrigins = [
-  "http://localhost:3000",
-  "https://secsales.vercel.app",
-];
+// const allowedOrigins = [
+//   "http://localhost:3000",
+//   "https://secsales.vercel.app",
+// ];
 
-app.use(
-  cors({
-    origin: (origin, callback) => {
-      if (!origin) return callback(null, true); // allow Postman / mobile
+// app.use(
+//   cors({
+//     origin: (origin, callback) => {
+//       if (!origin) return callback(null, true); // allow Postman / mobile
 
-      if (allowedOrigins.includes(origin)) {
-        return callback(null, true);
-      }
+//       if (allowedOrigins.includes(origin)) {
+//         return callback(null, true);
+//       }
 
-      return callback(new Error("Not allowed by CORS"));
-    },
-    credentials: true,
-  })
-);
+//       return callback(new Error("Not allowed by CORS"));
+//     },
+//     credentials: true,
+//   })
+// );
 
 // app.use((req, res, next) => {
 //   res.setHeader(
@@ -145,6 +145,14 @@ app.use(
 // });
 
 // Middleware
+app.use(
+  cors({
+    origin: true, // reflect request origin
+    credentials: true,
+    methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization"],
+  }),
+);
 app.use(express.json());
 
 // Test route
