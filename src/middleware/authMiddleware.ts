@@ -11,6 +11,7 @@ const USERS_PATH = "users";
 
 // Middleware to check if user is logged in and token is valid
 export const protect = async (req: AuthRequest, res: Response, next: NextFunction) => {
+    if (req.method === "OPTIONS") return next();
     let token: string | undefined;
 
     if (
