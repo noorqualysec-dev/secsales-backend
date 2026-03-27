@@ -121,7 +121,7 @@ app.use((req, res, next) => {
 });
 
 // ✅ 2. HANDLE PREFLIGHT (ADD HERE)
-app.options("*", (req, res) => {
+app.options("/*", (req, res) => {
   res.status(200).end();
 });
 
