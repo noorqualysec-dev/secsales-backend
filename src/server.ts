@@ -68,6 +68,7 @@ const allowedOrigins = [
     "http://localhost:3000",
     "http://localhost:3001",
     "http://localhost:4200",
+    "https://secsales.vercel.app",
     process.env.FRONTEND_URL,           // set this in Vercel env vars
 ].filter(Boolean) as string[];
 
