@@ -1,9 +1,5 @@
 import express from "express";
-import dotenv from "dotenv";
 import cors from 'cors';
-
-// MUST be first — loads env vars before anything else uses them
-dotenv.config();
 
 // Route imports
 import userRoutes from "./routes/userRoutes.js";

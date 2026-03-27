@@ -6,7 +6,7 @@
   "scripts": {
     "build": "tsc",
     "start": "node dist/server.js",
-    "dev": "npx tsx --watch src/server.ts",
+    "dev": "npx tsx --env-file=.env --watch src/server.ts",
     "seed": "npx tsx src/scripts/seedData.ts"
   },
   "keywords": [],
