@@ -121,9 +121,9 @@ app.use((req, res, next) => {
 });
 
 // ✅ 2. HANDLE PREFLIGHT (ADD HERE)
-app.options("/*", (req, res) => {
-  res.status(200).end();
-});
+// app.options("/*", (req, res) => {
+//   res.status(200).end();
+// });
 
 // Middleware
 app.use(express.json());
