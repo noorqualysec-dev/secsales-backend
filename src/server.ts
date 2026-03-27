@@ -64,8 +64,15 @@ import "./config/firebase.js";
 const app = express();
 
 // Enable CORS
+const allowedOrigins = [
+    "http://localhost:3000",
+    "http://localhost:3001",
+    "http://localhost:4200",
+    process.env.FRONTEND_URL,           // set this in Vercel env vars
+].filter(Boolean) as string[];
+
 app.use(cors({
-    origin: ["http://localhost:3000", "http://localhost:3001", "http://localhost:4200"],
+    origin: allowedOrigins,
     credentials: true,
     methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization"],
