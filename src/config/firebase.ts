@@ -39,26 +39,60 @@
 // export const rtdb = getDatabase();
 // export const storage = getStorage();
 // export default admin;
+// import admin from "firebase-admin";
+// import { getFirestore } from "firebase-admin/firestore";
+// import { getDatabase } from "firebase-admin/database";
+// import { getStorage } from "firebase-admin/storage";
+
+// if (!admin.apps.length) {
+//   const project_id = process.env.FIREBASE_PROJECT_ID!;
+//   const client_email = process.env.FIREBASE_CLIENT_EMAIL!;
+//   const private_key = process.env.FIREBASE_PRIVATE_KEY!.replace(/\\n/g, "\n");
+
+//   admin.initializeApp({
+//     credential: admin.credential.cert({ project_id, client_email, private_key } as any),
+//     databaseURL: process.env.FIREBASE_DATABASE_URL!,
+//     storageBucket: `${project_id}.firebasestorage.app`,
+//   });
+
+//   console.log("🔥 Firebase Admin SDK initialized for project:", process.env.FIREBASE_PROJECT_ID);
+// }
+
+// export const db = getFirestore();
+// export const rtdb = getDatabase();
+// export const storage = getStorage();
+// export default admin;
+
 import admin from "firebase-admin";
 import { getFirestore } from "firebase-admin/firestore";
 import { getDatabase } from "firebase-admin/database";
 import { getStorage } from "firebase-admin/storage";
 
 if (!admin.apps.length) {
-  const project_id = process.env.FIREBASE_PROJECT_ID!;
-  const client_email = process.env.FIREBASE_CLIENT_EMAIL!;
-  const private_key = process.env.FIREBASE_PRIVATE_KEY!.replace(/\\n/g, "\n");
+  const project_id = process.env.FIREBASE_PROJECT_ID;
+  const client_email = process.env.FIREBASE_CLIENT_EMAIL;
+  const private_key = process.env.FIREBASE_PRIVATE_KEY;
+  const databaseURL = process.env.FIREBASE_DATABASE_URL;
 
-  admin.initializeApp({
-    credential: admin.credential.cert({ project_id, client_email, private_key } as any),
-    databaseURL: process.env.FIREBASE_DATABASE_URL!,
-    storageBucket: `${project_id}.firebasestorage.app`,
-  });
+  if (!project_id || !client_email || !private_key || !databaseURL) {
+    console.error("❌ Firebase ENV variables missing");
+  } else {
+    admin.initializeApp({
+      credential: admin.credential.cert({
+        projectId: project_id,
+        clientEmail: client_email,
+        privateKey: private_key.replace(/\\n/g, "\n"),
+      }),
+      databaseURL: databaseURL,
+      storageBucket: `${project_id}.firebasestorage.app`,
+    });
 
-  console.log("🔥 Firebase Admin SDK initialized for project:", process.env.FIREBASE_PROJECT_ID);
+    console.log("🔥 Firebase initialized:", project_id);
+  }
 }
 
 export const db = getFirestore();
 export const rtdb = getDatabase();
 export const storage = getStorage();
+
 export default admin;
