@@ -170,11 +170,11 @@ app.get("/", (req, res) => {
 });
 
 // Routes
-app.use("/api/users", userRoutes);
-app.use("/api/leads", leadRoutes);
-app.use("/api/proposals", proposalRoutes);
-app.use("/api/productivity", productivityRoutes);
-app.use("/api/admin", adminRoutes);
+app.use("/api/proxy/users", userRoutes);
+app.use("/api/proxy/leads", leadRoutes);
+app.use("/api/proxy/proposals", proposalRoutes);
+app.use("/api/proxy/productivity", productivityRoutes);
+app.use("/api/proxy/admin", adminRoutes);
 
 // ❗ IMPORTANT: NO app.listen here
 
