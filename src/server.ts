@@ -62,6 +62,7 @@ import adminRoutes from "./routes/adminRoutes.js";
 import "./config/firebase.js";
 
 const app = express();
+const clientUrl = process.env.CLIENT_URL || 'http://localhost:3000';
 
 // Enable CORS
 // const allowedOrigins = [
@@ -145,13 +146,19 @@ const app = express();
 // });
 
 // Middleware
+// app.use(
+//   cors({
+//     origin: true, // reflect request origin
+//     credentials: true,
+//     methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+//     allowedHeaders: ["Content-Type", "Authorization"],
+//   }),
+// );
 app.use(
   cors({
-    origin: true, // reflect request origin
-    credentials: true,
-    methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization"],
-  }),
+    origin: clientUrl,
+    credentials: true
+  })
 );
 app.use(express.json());
 
