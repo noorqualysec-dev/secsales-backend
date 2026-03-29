@@ -62,7 +62,7 @@ import adminRoutes from "./routes/adminRoutes.js";
 import "./config/firebase.js";
 
 const app = express();
-const clientUrl = process.env.CLIENT_URL || 'http://localhost:3000';
+const clientUrl = process.env.FRONTEND_URL || 'http://localhost:3000';
 
 // Enable CORS
 // const allowedOrigins = [
@@ -156,10 +156,23 @@ const clientUrl = process.env.CLIENT_URL || 'http://localhost:3000';
 // );
 app.use(
   cors({
-    origin: clientUrl,
-    credentials: true
+    origin: (origin, callback) => {
+      if (!origin) return callback(null, true);
+
+      if (
+        origin.includes("localhost") ||
+        origin.includes("vercel.app")
+      ) {
+        return callback(null, true);
+      }
+
+      return callback(new Error("CORS blocked"));
+    },
+    credentials: true,
   })
 );
+
+app.options("*", cors());
 app.use(express.json());
 
 // Test route
@@ -170,11 +183,11 @@ app.get("/", (req, res) => {
 });
 
 // Routes
-app.use("/api/proxy/users", userRoutes);
-app.use("/api/proxy/leads", leadRoutes);
-app.use("/api/proxy/proposals", proposalRoutes);
-app.use("/api/proxy/productivity", productivityRoutes);
-app.use("/api/proxy/admin", adminRoutes);
+app.use("/api/users", userRoutes);
+app.use("/api/leads", leadRoutes);
+app.use("/api/proposals", proposalRoutes);
+app.use("/api/productivity", productivityRoutes);
+app.use("/api/admin", adminRoutes);
 
 // ❗ IMPORTANT: NO app.listen here
 
