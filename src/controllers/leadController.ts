@@ -7,6 +7,56 @@ const LEADS_PATH = "leads";
 const USERS_PATH = "users";
 const PROPOSALS_PATH = "proposals";
 
+const DIAL_CODE_RE = /^\+\d{1,4}$/;
+const NATIONAL_PHONE_RE = /^\d{4,15}$/;
+
+/** When both inputs empty after trim, returns empty strings (clear phone). Otherwise validates pair. */
+function normalizePhonePair(
+    codeRaw: unknown,
+    phoneRaw: unknown
+): { error: string } | { phoneCountryCode: string; phone: string } {
+    const code0 = String(codeRaw ?? "").trim();
+    const phone0 = String(phoneRaw ?? "").trim();
+    const hasAny = code0.length > 0 || phone0.length > 0;
+    if (!hasAny) {
+        return { phoneCountryCode: "", phone: "" };
+    }
+    if (!code0 || !phone0) {
+        return { error: "Country calling code and national phone number must both be provided together." };
+    }
+    if (/[a-zA-Z]/.test(phone0)) {
+        return { error: "Phone number must contain digits only (no letters)." };
+    }
+    if (!DIAL_CODE_RE.test(code0)) {
+        return { error: "Invalid country calling code." };
+    }
+    if (!NATIONAL_PHONE_RE.test(phone0)) {
+        return { error: "Phone must be between 4 and 15 digits." };
+    }
+    return { phoneCountryCode: code0, phone: phone0 };
+}
+
+function normalizeIndustry(indRaw: unknown): { error: string } | { industry: string | undefined } {
+    if (indRaw === undefined || indRaw === null) {
+        return { industry: undefined };
+    }
+    const s = String(indRaw).trim();
+    if (s.length > 120) {
+        return { error: "Industry must be at most 120 characters." };
+    }
+    return { industry: s || undefined };
+}
+
+function applyNormalizedPhoneToLeadData(leadData: Partial<ILead>, norm: { phoneCountryCode: string; phone: string }) {
+    if (!norm.phoneCountryCode && !norm.phone) {
+        delete leadData.phoneCountryCode;
+        leadData.phone = "";
+    } else {
+        leadData.phoneCountryCode = norm.phoneCountryCode;
+        leadData.phone = norm.phone;
+    }
+}
+
 // Helper for manual "population"
 const populateRef = async (path: string, id: string, fields: string[]) => {
     if (!id) return null;
@@ -68,6 +118,26 @@ export const getLeads = async (req: AuthRequest, res: Response) => {
 export const createLead = async (req: AuthRequest, res: Response) => {
   try {
     const leadData: Partial<ILead> = { ...req.body };
+
+    const phoneNorm = normalizePhonePair(leadData.phoneCountryCode, leadData.phone);
+    if ("error" in phoneNorm) {
+        res.status(400).json({ success: false, message: phoneNorm.error });
+        return;
+    }
+    applyNormalizedPhoneToLeadData(leadData, phoneNorm);
+
+    if (leadData.industry !== undefined && leadData.industry !== null) {
+        const indNorm = normalizeIndustry(leadData.industry);
+        if ("error" in indNorm) {
+            res.status(400).json({ success: false, message: indNorm.error });
+            return;
+        }
+        if (indNorm.industry !== undefined) {
+            leadData.industry = indNorm.industry;
+        } else {
+            delete leadData.industry;
+        }
+    }
 
     leadData.createdBy = req.user.id;
     if (req.user.role !== "admin" || !leadData.assignedTo) {
@@ -215,6 +285,36 @@ export const updateLead = async (req: AuthRequest, res: Response) => {
     }
 
     const updates: any = { ...req.body, updatedAt: Date.now() };
+
+    const phoneKeysTouched = Object.prototype.hasOwnProperty.call(req.body, "phone")
+        || Object.prototype.hasOwnProperty.call(req.body, "phoneCountryCode");
+    if (phoneKeysTouched) {
+        const mergedCode = updates.phoneCountryCode !== undefined
+            ? String(updates.phoneCountryCode ?? "").trim()
+            : String(lead.phoneCountryCode ?? "").trim();
+        const mergedPhone = updates.phone !== undefined
+            ? String(updates.phone ?? "").trim()
+            : String(lead.phone ?? "").trim();
+        const phoneNorm = normalizePhonePair(mergedCode, mergedPhone);
+        if ("error" in phoneNorm) {
+            res.status(400).json({ success: false, message: phoneNorm.error });
+            return;
+        }
+        applyNormalizedPhoneToLeadData(updates, phoneNorm);
+    } else {
+        delete updates.phone;
+        delete updates.phoneCountryCode;
+    }
+
+    if (updates.industry !== undefined) {
+        const indNorm = normalizeIndustry(updates.industry);
+        if ("error" in indNorm) {
+            res.status(400).json({ success: false, message: indNorm.error });
+            return;
+        }
+        updates.industry = indNorm.industry;
+    }
+
     const timeline = [...(lead.timeline || [])];
 
     if (updates.status && updates.status !== lead.status) {

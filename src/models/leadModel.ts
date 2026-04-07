@@ -14,6 +14,8 @@ export interface ILead {
     designation?: string;
     employeeStrength?: "1-10" | "11-50" | "51-200" | "201-500" | "501-1000" | "1000+";
     phone?: string;
+    /** E.164 calling code only, e.g. "+91". National digits live in `phone`. */
+    phoneCountryCode?: string;
     company?: string;
     country?: string;
     industry?: string;
@@ -51,4 +53,13 @@ export const LEAD_STATUSES = [
     "Negotiation",
     "Won",
     "Lost"
+] as const;
+
+/** Preset industry labels for UI dropdowns; custom values still allowed via "Other". */
+export const LEAD_INDUSTRY_PRESETS = [
+    "Technology",
+    "Healthcare",
+    "Financial Services",
+    "Manufacturing",
+    "Retail",
 ] as const;
