@@ -8,6 +8,9 @@ export interface IMeeting {
     leadId: string; // Lead ID
     createdAt: number;
     updatedAt: number;
+    googleEventId?: string;
+    meetLink?: string | null;
+    syncStatus?: "synced" | "pending" | "failed";
 }
 
 export const MEETING_STATUSES = ["Scheduled", "Completed", "Cancelled"] as const;

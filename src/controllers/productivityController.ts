@@ -1,6 +1,7 @@
 import type { Response } from "express";
 import type { AuthRequest } from "../middleware/authMiddleware.js";
 import { rtdb } from "../config/firebase.js";
+import { MeetingGoogleSyncService } from "../services/meetingGoogleSyncService.js";
 
 const LEADS_PATH = "leads";
 const TASKS_PATH = "tasks";
@@ -98,9 +99,13 @@ export const updateTask = async (req: AuthRequest, res: Response) => {
  */
 export const updateMeeting = async (req: AuthRequest, res: Response) => {
     try {
-        const { id } = req.params;
+        const { id } = req.params as { id: string };
         const updates = req.body;
         await rtdb.ref(`${MEETINGS_PATH}/${id}`).update({ ...updates, updatedAt: Date.now() });
+
+        // Sync to Google Calendar
+        MeetingGoogleSyncService.syncMeeting(id).catch(console.error);
+
         res.status(200).json({ success: true });
     } catch (error: any) {
         res.status(500).json({ success: false, message: error.message });
@@ -129,6 +134,9 @@ export const scheduleMeeting = async (req: AuthRequest, res: Response) => {
         };
 
         await meetingRef.set(meetingData);
+
+        // Sync to Google Calendar
+        MeetingGoogleSyncService.syncMeeting(meetingData.id).catch(console.error);
         
         // Update lead timeline
         const leadRef = rtdb.ref(`${LEADS_PATH}/${leadId}`);

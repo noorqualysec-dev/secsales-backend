@@ -6,6 +6,11 @@ export interface IUser {
     isActive: boolean;
     createdAt: number;
     updatedAt: number;
+    googleTokens?: {
+        accessToken: string;
+        refreshToken: string;
+        expiry: number;
+    };
 }
 
 export const USER_ROLES = ["admin", "sales_rep", "manager"] as const;

@@ -57,6 +57,8 @@ import leadRoutes from "./routes/leadRoutes.js";
 import proposalRoutes from "./routes/proposalRoutes.js";
 import productivityRoutes from "./routes/productivityRoutes.js";
 import adminRoutes from "./routes/adminRoutes.js";
+import authRoutes from "./routes/authRoutes.js";
+import integrationRoutes from "./routes/integrationRoutes.js";
 
 // Firebase initialization
 import "./config/firebase.js";
@@ -188,6 +190,8 @@ app.use("/api/leads", leadRoutes);
 app.use("/api/proposals", proposalRoutes);
 app.use("/api/productivity", productivityRoutes);
 app.use("/api/admin", adminRoutes);
+app.use("/api/auth", authRoutes);
+app.use("/api/integrations", integrationRoutes);
 
 // ❗ IMPORTANT: NO app.listen here
 

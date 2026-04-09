@@ -6,7 +6,7 @@
   "scripts": {
     "build": "tsc",
     "start": "node dist/server.js",
-    "dev": "npx tsx --env-file=.env --watch src/server.ts",
+    "dev": "npx tsx --env-file=.env src/index.ts",
     "seed": "npx tsx src/scripts/seedData.ts"
   },
   "keywords": [],
@@ -23,6 +23,7 @@
     "express": "^5.2.1",
     "firebase": "^12.11.0",
     "firebase-admin": "^13.7.0",
+    "googleapis": "^171.4.0",
     "jsonwebtoken": "^9.0.3",
     "mongoose": "^9.3.0",
     "serverless-http": "^4.0.0",
