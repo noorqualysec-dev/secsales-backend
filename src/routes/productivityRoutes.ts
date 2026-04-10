@@ -2,6 +2,7 @@ import express from "express";
 import { protect } from "../middleware/authMiddleware.js";
 import {
   getSalesSummary,
+  getTasks,
   getMeetings,
   getMeetingById,
   scheduleMeeting,
@@ -15,6 +16,7 @@ import {
 const router = express.Router();
 
 router.get("/summary", protect, getSalesSummary);
+router.get("/tasks", protect, getTasks);
 router.get("/meetings", protect, getMeetings);
 router.get("/meetings/:id", protect, getMeetingById);
 router.post("/meetings", protect, scheduleMeeting);

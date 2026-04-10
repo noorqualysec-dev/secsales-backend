@@ -8,13 +8,17 @@ import type {
     MeetingMode,
     MeetingStatus,
 } from "../models/meetingModel.js";
+import { TASK_PRIORITIES, TASK_STATUSES, type ITask, type TaskSource } from "../models/taskModel.js";
 
 const LEADS_PATH = "leads";
 const TASKS_PATH = "tasks";
 const MEETINGS_PATH = "meetings";
 const USER_ROLES_WITH_GLOBAL_MEETING_ACCESS = new Set(["admin", "manager"]);
+const USER_ROLES_WITH_GLOBAL_TASK_ACCESS = new Set(["admin", "manager"]);
 const ALLOWED_MEETING_STATUSES = new Set<MeetingStatus>(["Scheduled", "Completed", "Cancelled"]);
 const ALLOWED_MEETING_MODES = new Set<MeetingMode>(["google_meet", "zoom", "phone", "in_person", "other"]);
+const ALLOWED_TASK_STATUSES = new Set<string>(TASK_STATUSES);
+const ALLOWED_TASK_PRIORITIES = new Set<string>(TASK_PRIORITIES);
 
 const getMeetingStartTime = (meeting: any): number => Number(meeting.startTime ?? meeting.from ?? 0);
 const getMeetingEndTime = (meeting: any): number => Number(meeting.endTime ?? meeting.to ?? 0);
@@ -23,6 +27,16 @@ const getMeetingSubject = (meeting: any): string => String(meeting.subject ?? me
 const canAccessMeeting = (user: AuthRequest["user"], meeting: any): boolean => {
     if (!user) return false;
     return USER_ROLES_WITH_GLOBAL_MEETING_ACCESS.has(user.role) || meeting.assignedTo === user.id;
+};
+
+const canAccessTask = (user: AuthRequest["user"], task: any): boolean => {
+    if (!user) return false;
+    return USER_ROLES_WITH_GLOBAL_TASK_ACCESS.has(user.role) || task.assignedTo === user.id || task.createdBy === user.id;
+};
+
+const canDeleteTask = (user: AuthRequest["user"], task: any): boolean => {
+    if (!user) return false;
+    return USER_ROLES_WITH_GLOBAL_TASK_ACCESS.has(user.role) || task.createdBy === user.id;
 };
 
 const normalizeAttendees = (attendees: unknown): IMeetingAttendee[] => {
@@ -179,6 +193,40 @@ const fetchLeadById = async (leadId: string) => {
     return leadSnapshot.val();
 };
 
+const fetchUserById = async (userId: string) => {
+    const userSnapshot = await rtdb.ref(`users/${userId}`).once("value");
+    return userSnapshot.val();
+};
+
+const buildTaskResponse = (
+    task: any,
+    leads: Record<string, any>,
+    users: Record<string, any> = {}
+) => {
+    const lead = task.leadId ? leads[task.leadId] : null;
+    const assignee = task.assignedTo ? users[task.assignedTo] : null;
+    const creator = task.createdBy ? users[task.createdBy] : null;
+
+    return {
+        ...task,
+        leadName: lead ? `${lead.firstName || ""} ${lead.lastName || ""}`.trim() : undefined,
+        company: lead?.company || undefined,
+        assignedToName: assignee?.name,
+        assignedByName: task.assignedBy ? users[task.assignedBy]?.name : undefined,
+        createdByName: creator?.name,
+        lead: lead
+            ? {
+                id: task.leadId,
+                firstName: lead.firstName,
+                lastName: lead.lastName,
+                email: lead.email,
+                company: lead.company || "Individual",
+                status: lead.status,
+            }
+            : null,
+    };
+};
+
 const fetchMeetingWithLead = async (meetingId: string) => {
     const meetingSnapshot = await rtdb.ref(`${MEETINGS_PATH}/${meetingId}`).once("value");
     const meeting = meetingSnapshot.val();
@@ -206,6 +254,13 @@ const addLeadTimelineEntry = async (leadId: string, remark: string, performedBy:
     });
 
     await leadRef.update({ timeline, updatedAt: Date.now() });
+};
+
+const GLOBAL_TASK_ASSIGNABLE_ROLES = new Set(["sales_rep", "manager"]);
+
+const resolveTaskSource = (creatorRole: string, createdBy: string, assignedTo: string): TaskSource => {
+    if (assignedTo === createdBy) return "self";
+    return creatorRole === "admin" || creatorRole === "manager" ? "admin" : "self";
 };
 
 export const getSalesSummary = async (req: AuthRequest, res: Response) => {
@@ -248,6 +303,9 @@ export const getSalesSummary = async (req: AuthRequest, res: Response) => {
                 getMeetingStartTime(meeting) <= startOfToday + 86400000
             ).length,
             totalMyLeads: myLeads.length,
+            allTasks: tasksWithIds
+                .filter((task: any) => task.assignedTo === userId)
+                .map(attachLead),
             openTasks: tasksWithIds
                 .filter((task: any) => task.assignedTo === userId && task.status !== "Completed")
                 .map(attachLead),
@@ -304,6 +362,58 @@ export const getMeetings = async (req: AuthRequest, res: Response) => {
     }
 };
 
+export const getTasks = async (req: AuthRequest, res: Response) => {
+    try {
+        const { status, priority, leadId, assignedTo, search } = req.query as Record<string, string | undefined>;
+        const [tasksSnapshot, leadsSnapshot, usersSnapshot] = await Promise.all([
+            rtdb.ref(TASKS_PATH).once("value"),
+            rtdb.ref(LEADS_PATH).once("value"),
+            rtdb.ref("users").once("value"),
+        ]);
+
+        const tasks = tasksSnapshot.val() || {};
+        const leads = leadsSnapshot.val() || {};
+        const users = usersSnapshot.val() || {};
+
+        let items = Object.entries(tasks).map(([id, task]: [string, any]) => ({ ...task, id }));
+
+        if (!USER_ROLES_WITH_GLOBAL_TASK_ACCESS.has(req.user!.role)) {
+            items = items.filter((task: any) => task.assignedTo === req.user!.id || task.createdBy === req.user!.id);
+        } else if (assignedTo) {
+            items = items.filter((task: any) => task.assignedTo === assignedTo);
+        }
+
+        if (status) items = items.filter((task: any) => task.status === status);
+        if (priority) items = items.filter((task: any) => task.priority === priority);
+        if (leadId) items = items.filter((task: any) => task.leadId === leadId);
+        if (search) {
+            const query = search.toLowerCase();
+            items = items.filter((task: any) => {
+                const lead = task.leadId ? leads[task.leadId] : null;
+                const leadName = lead ? `${lead.firstName || ""} ${lead.lastName || ""}`.trim().toLowerCase() : "";
+                return (
+                    String(task.subject || "").toLowerCase().includes(query) ||
+                    String(task.description || "").toLowerCase().includes(query) ||
+                    leadName.includes(query)
+                );
+            });
+        }
+
+        const data = items
+            .sort((a: any, b: any) => {
+                const aDue = Number(a.dueDate || 0);
+                const bDue = Number(b.dueDate || 0);
+                if (aDue !== bDue) return aDue - bDue;
+                return Number(b.updatedAt || 0) - Number(a.updatedAt || 0);
+            })
+            .map((task: any) => buildTaskResponse(task, leads, users));
+
+        res.status(200).json({ success: true, count: data.length, data });
+    } catch (error: any) {
+        res.status(500).json({ success: false, message: error.message });
+    }
+};
+
 export const getMeetingById = async (req: AuthRequest, res: Response) => {
     try {
         const meetingSnapshot = await rtdb.ref(`${MEETINGS_PATH}/${req.params.id}`).once("value");
@@ -334,9 +444,126 @@ export const getMeetingById = async (req: AuthRequest, res: Response) => {
 export const updateTask = async (req: AuthRequest, res: Response) => {
     try {
         const { id } = req.params;
-        const updates = req.body;
-        await rtdb.ref(`${TASKS_PATH}/${id}`).update({ ...updates, updatedAt: Date.now() });
-        res.status(200).json({ success: true });
+        const taskRef = rtdb.ref(`${TASKS_PATH}/${id}`);
+        const snapshot = await taskRef.once("value");
+        const existingTask = snapshot.val();
+
+        if (!existingTask) {
+            res.status(404).json({ success: false, message: "Task not found" });
+            return;
+        }
+
+        if (!canAccessTask(req.user, existingTask)) {
+            res.status(403).json({ success: false, message: "Not authorized to update this task" });
+            return;
+        }
+
+        const updates: Record<string, any> = {};
+
+        if (req.body.subject !== undefined) {
+            const subject = String(req.body.subject || "").trim();
+            if (!subject) {
+                res.status(400).json({ success: false, message: "Task subject is required" });
+                return;
+            }
+            updates.subject = subject;
+        }
+
+        if (req.body.description !== undefined) {
+            updates.description = String(req.body.description || "").trim();
+        }
+
+        if (req.body.dueDate !== undefined) {
+            const dueDate = Number(req.body.dueDate);
+            if (!Number.isFinite(dueDate)) {
+                res.status(400).json({ success: false, message: "Valid due date is required" });
+                return;
+            }
+            updates.dueDate = dueDate;
+        }
+
+        if (req.body.status !== undefined) {
+            if (!ALLOWED_TASK_STATUSES.has(req.body.status)) {
+                res.status(400).json({ success: false, message: "Invalid task status" });
+                return;
+            }
+            updates.status = req.body.status;
+
+            if (req.body.status === "Completed") {
+                updates.completedAt = Date.now();
+                updates.completedBy = req.user!.id;
+                updates.completionRemark = String(req.body.completionRemark || existingTask.completionRemark || "").trim();
+            } else if (existingTask.status === "Completed") {
+                updates.completedAt = null;
+                updates.completedBy = null;
+                updates.completionRemark = null;
+            }
+        }
+
+        if (req.body.priority !== undefined) {
+            if (!ALLOWED_TASK_PRIORITIES.has(req.body.priority)) {
+                res.status(400).json({ success: false, message: "Invalid task priority" });
+                return;
+            }
+            updates.priority = req.body.priority;
+        }
+
+        if (req.body.leadId !== undefined) {
+            const leadId = String(req.body.leadId || "").trim();
+            if (leadId) {
+                const lead = await fetchLeadById(leadId);
+                if (!lead) {
+                    res.status(404).json({ success: false, message: "Lead not found" });
+                    return;
+                }
+                updates.leadId = leadId;
+            } else {
+                updates.leadId = null;
+            }
+        }
+
+        if (req.body.assignedTo !== undefined) {
+            if (!USER_ROLES_WITH_GLOBAL_TASK_ACCESS.has(req.user!.role)) {
+                res.status(403).json({ success: false, message: "Only admins and managers can reassign tasks" });
+                return;
+            }
+
+            const assignedTo = String(req.body.assignedTo || "").trim();
+            if (!assignedTo) {
+                res.status(400).json({ success: false, message: "Assigned user is required" });
+                return;
+            }
+
+            const assignedUser = await fetchUserById(assignedTo);
+            if (!assignedUser) {
+                res.status(404).json({ success: false, message: "Assigned user not found" });
+                return;
+            }
+
+            updates.assignedTo = assignedTo;
+            updates.assignedBy = req.user!.id;
+            updates.source = resolveTaskSource(req.user!.role, existingTask.createdBy, assignedTo);
+            updates.isRead = assignedTo === req.user!.id;
+        }
+
+        if (req.body.completionRemark !== undefined) {
+            updates.completionRemark = String(req.body.completionRemark || "").trim() || null;
+        }
+
+        updates.updatedAt = Date.now();
+
+        await taskRef.update(updates);
+
+        const [tasksSnapshot, leadsSnapshot, usersSnapshot] = await Promise.all([
+            taskRef.once("value"),
+            rtdb.ref(LEADS_PATH).once("value"),
+            rtdb.ref("users").once("value"),
+        ]);
+
+        res.status(200).json({
+            success: true,
+            data: buildTaskResponse({ ...tasksSnapshot.val(), id }, leadsSnapshot.val() || {}, usersSnapshot.val() || {}),
+        });
     } catch (error: any) {
         res.status(500).json({ success: false, message: error.message });
     }
@@ -454,26 +681,95 @@ export const scheduleMeeting = async (req: AuthRequest, res: Response) => {
 
 export const createTask = async (req: AuthRequest, res: Response) => {
     try {
-        const { leadId, subject, dueDate, priority } = req.body;
+        const { leadId, subject, dueDate, priority, status, description } = req.body;
         const userId = req.user!.id;
+        const userRole = req.user!.role;
+        const trimmedSubject = String(subject || "").trim();
+
+        if (!trimmedSubject) {
+            res.status(400).json({ success: false, message: "Task subject is required" });
+            return;
+        }
+
+        const normalizedDueDate = Number(dueDate);
+        if (!Number.isFinite(normalizedDueDate)) {
+            res.status(400).json({ success: false, message: "Valid due date is required" });
+            return;
+        }
+
+        const normalizedPriority = priority || "Medium";
+        if (!ALLOWED_TASK_PRIORITIES.has(normalizedPriority)) {
+            res.status(400).json({ success: false, message: "Invalid task priority" });
+            return;
+        }
+
+        const normalizedStatus = status || "Pending";
+        if (!ALLOWED_TASK_STATUSES.has(normalizedStatus)) {
+            res.status(400).json({ success: false, message: "Invalid task status" });
+            return;
+        }
+
+        let assignedTo = userId;
+        if (req.body.assignedTo !== undefined) {
+            const requestedAssignee = String(req.body.assignedTo || "").trim();
+
+            if (!requestedAssignee) {
+                res.status(400).json({ success: false, message: "Assigned user is required" });
+                return;
+            }
+
+            if (!USER_ROLES_WITH_GLOBAL_TASK_ACCESS.has(userRole) && requestedAssignee !== userId) {
+                res.status(403).json({ success: false, message: "Sales reps can only create tasks for themselves" });
+                return;
+            }
+
+            const assignedUser = await fetchUserById(requestedAssignee);
+            if (!assignedUser) {
+                res.status(404).json({ success: false, message: "Assigned user not found" });
+                return;
+            }
+
+            if (USER_ROLES_WITH_GLOBAL_TASK_ACCESS.has(userRole) && !GLOBAL_TASK_ASSIGNABLE_ROLES.has(assignedUser.role)) {
+                res.status(400).json({ success: false, message: "Tasks can only be assigned to sales reps or managers" });
+                return;
+            }
+
+            assignedTo = requestedAssignee;
+        }
+
+        let normalizedLeadId: string | undefined;
+        if (leadId) {
+            normalizedLeadId = String(leadId).trim();
+            const lead = await fetchLeadById(normalizedLeadId);
+            if (!lead) {
+                res.status(404).json({ success: false, message: "Lead not found" });
+                return;
+            }
+        }
 
         const taskRef = rtdb.ref(TASKS_PATH).push();
-        const taskData = {
+        const source = resolveTaskSource(userRole, userId, assignedTo);
+        const taskData: ITask = {
             id: taskRef.key,
-            subject,
-            dueDate: Number(dueDate),
-            status: "Pending",
-            priority: priority || "Medium",
-            assignedTo: userId,
-            leadId,
+            subject: trimmedSubject,
+            description: String(description || "").trim(),
+            dueDate: normalizedDueDate,
+            status: normalizedStatus,
+            priority: normalizedPriority,
+            assignedTo,
+            assignedBy: userId,
+            createdBy: userId,
+            source,
+            isRead: assignedTo === userId,
             createdAt: Date.now(),
             updatedAt: Date.now(),
+            ...(normalizedLeadId ? { leadId: normalizedLeadId } : {}),
         };
 
         await taskRef.set(taskData);
 
-        if (leadId) {
-            const leadRef = rtdb.ref(`${LEADS_PATH}/${leadId}`);
+        if (normalizedLeadId) {
+            const leadRef = rtdb.ref(`${LEADS_PATH}/${normalizedLeadId}`);
             const leadSnap = await leadRef.once("value");
             const lead = leadSnap.val();
 
@@ -481,7 +777,7 @@ export const createTask = async (req: AuthRequest, res: Response) => {
                 const timeline = lead.timeline || [];
                 timeline.push({
                     event: "Status Changed",
-                    remark: `Task created: ${subject}`,
+                    remark: `Task created: ${trimmedSubject}`,
                     performedBy: userId,
                     timestamp: Date.now(),
                 });
@@ -489,7 +785,15 @@ export const createTask = async (req: AuthRequest, res: Response) => {
             }
         }
 
-        res.status(201).json({ success: true, data: taskData });
+        const [leadsSnapshot, usersSnapshot] = await Promise.all([
+            rtdb.ref(LEADS_PATH).once("value"),
+            rtdb.ref("users").once("value"),
+        ]);
+
+        res.status(201).json({
+            success: true,
+            data: buildTaskResponse(taskData, leadsSnapshot.val() || {}, usersSnapshot.val() || {}),
+        });
     } catch (error: any) {
         res.status(500).json({ success: false, message: error.message });
     }
@@ -524,8 +828,22 @@ export const deleteMeeting = async (req: AuthRequest, res: Response) => {
 export const deleteTask = async (req: AuthRequest, res: Response) => {
     try {
         const { id } = req.params;
-        await rtdb.ref(`${TASKS_PATH}/${id}`).remove();
-        res.status(200).json({ success: true });
+        const taskRef = rtdb.ref(`${TASKS_PATH}/${id}`);
+        const snapshot = await taskRef.once("value");
+        const task = snapshot.val();
+
+        if (!task) {
+            res.status(404).json({ success: false, message: "Task not found" });
+            return;
+        }
+
+        if (!canDeleteTask(req.user, task)) {
+            res.status(403).json({ success: false, message: "Not authorized to delete this task" });
+            return;
+        }
+
+        await taskRef.remove();
+        res.status(200).json({ success: true, message: "Task deleted successfully" });
     } catch (error: any) {
         res.status(500).json({ success: false, message: error.message });
     }
