@@ -94,7 +94,8 @@ export const getGoogleEvents = async (req: AuthRequest, res: Response) => {
         });
     } catch (error: any) {
         console.error('getGoogleEvents error:', error);
-        res.status(500).json({
+        const isNotConnected = error?.message === 'User not connected to Google';
+        res.status(isNotConnected ? 400 : 500).json({
             success: false,
             message: error?.message || 'Failed to fetch Google events',
         });

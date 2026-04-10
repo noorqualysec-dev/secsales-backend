@@ -3,6 +3,12 @@ import { GoogleOAuthService } from './googleOAuthService.js';
 
 const calendar = google.calendar('v3');
 
+export interface CalendarEventAttendee {
+    email?: string | null;
+    responseStatus?: string | null;
+    displayName?: string | null;
+}
+
 export interface CalendarEventData {
     summary: string;
     description?: string;
@@ -12,8 +18,32 @@ export interface CalendarEventData {
     location?: string;
 }
 
+export interface CalendarSyncResult {
+    eventId: string;
+    eventLink?: string | null;
+    meetLink?: string | null;
+    attendees?: CalendarEventAttendee[];
+}
+
+const extractCalendarSyncResult = (event: any): CalendarSyncResult => {
+    const meetLink = event?.conferenceData?.entryPoints?.find(
+        (entryPoint: any) => entryPoint.entryPointType === 'video'
+    )?.uri;
+
+    return {
+        eventId: event.id!,
+        eventLink: event.htmlLink || null,
+        meetLink: meetLink || null,
+        attendees: (event.attendees || []).map((attendee: any) => ({
+            email: attendee.email || null,
+            responseStatus: attendee.responseStatus || null,
+            displayName: attendee.displayName || null
+        }))
+    };
+};
+
 export class GoogleCalendarService {
-    static async createEvent(userId: string, eventData: CalendarEventData): Promise<{ eventId: string; meetLink?: string | null }> {
+    static async createEvent(userId: string, eventData: CalendarEventData): Promise<CalendarSyncResult> {
         const tokens = await GoogleOAuthService.getUserTokens(userId);
         if (!tokens) throw new Error('User not connected to Google');
 
@@ -34,38 +64,29 @@ export class GoogleCalendarService {
         const response = await calendar.events.insert({
             calendarId: 'primary',
             conferenceDataVersion: 1,
-            sendUpdates: 'none',
+            sendUpdates: 'all',
             requestBody: event,
             auth: client
         });
 
-        const meetLink = response.data.conferenceData?.entryPoints?.find((ep: any) => ep.entryPointType === 'video')?.uri;
-
-        if (meetLink) {
-            return {
-                eventId: response.data.id!,
-                meetLink
-            };
-        }
-
-        return {
-            eventId: response.data.id!
-        };
+        return extractCalendarSyncResult(response.data);
     }
 
-    static async updateEvent(userId: string, eventId: string, eventData: Partial<CalendarEventData>): Promise<void> {
+    static async updateEvent(userId: string, eventId: string, eventData: Partial<CalendarEventData>): Promise<CalendarSyncResult> {
         const tokens = await GoogleOAuthService.getUserTokens(userId);
         if (!tokens) throw new Error('User not connected to Google');
 
         const client = GoogleOAuthService.getOAuth2Client(tokens);
 
-        await calendar.events.update({
+        const response = await calendar.events.update({
             calendarId: 'primary',
             eventId: eventId,
             sendUpdates: 'none',
             requestBody: eventData,
             auth: client
         });
+
+        return extractCalendarSyncResult(response.data);
     }
 
     static async deleteEvent(userId: string, eventId: string): Promise<void> {

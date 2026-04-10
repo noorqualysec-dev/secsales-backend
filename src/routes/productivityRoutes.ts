@@ -2,6 +2,8 @@ import express from "express";
 import { protect } from "../middleware/authMiddleware.js";
 import {
   getSalesSummary,
+  getMeetings,
+  getMeetingById,
   scheduleMeeting,
   createTask,
   updateTask,
@@ -13,6 +15,8 @@ import {
 const router = express.Router();
 
 router.get("/summary", protect, getSalesSummary);
+router.get("/meetings", protect, getMeetings);
+router.get("/meetings/:id", protect, getMeetingById);
 router.post("/meetings", protect, scheduleMeeting);
 router.patch("/meetings/:id", protect, updateMeeting);
 router.delete("/meetings/:id", protect, deleteMeeting);

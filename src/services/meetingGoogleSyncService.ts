@@ -1,79 +1,154 @@
 import admin from '../config/firebase.js';
 import { GoogleCalendarService, type CalendarEventData } from './googleCalendarService.js';
 import { GoogleOAuthService } from './googleOAuthService.js';
+import type { IMeeting, IMeetingAttendee } from '../models/meetingModel.js';
+
+const MEETINGS_PATH = 'meetings';
+const LEADS_PATH = 'leads';
+const USERS_PATH = 'users';
+
+const mergeAttendees = (
+    meetingAttendees: IMeetingAttendee[] = [],
+    lead: any,
+    user: any
+): { email: string }[] => {
+    const attendeeMap = new Map<string, { email: string }>();
+
+    for (const attendee of meetingAttendees) {
+        if (!attendee?.email) continue;
+        attendeeMap.set(attendee.email.toLowerCase(), { email: attendee.email });
+    }
+
+    if (lead?.email) {
+        attendeeMap.set(String(lead.email).toLowerCase(), { email: lead.email });
+    }
+
+    if (user?.email) {
+        attendeeMap.set(String(user.email).toLowerCase(), { email: user.email });
+    }
+
+    return Array.from(attendeeMap.values());
+};
+
+const buildMeetingEventData = (meeting: IMeeting, lead: any, user: any): CalendarEventData => {
+    const eventData: CalendarEventData = {
+        summary: meeting.subject,
+        start: {
+            dateTime: new Date(meeting.startTime).toISOString(),
+            timeZone: 'UTC'
+        },
+        end: {
+            dateTime: new Date(meeting.endTime).toISOString(),
+            timeZone: 'UTC'
+        },
+        attendees: mergeAttendees(meeting.attendees, lead, user)
+    };
+
+    const description = meeting.description || meeting.agenda;
+    if (description) eventData.description = description;
+    if (meeting.location) eventData.location = meeting.location;
+
+    return eventData;
+};
 
 export class MeetingGoogleSyncService {
     static async syncMeeting(meetingId: string): Promise<void> {
         try {
-            // Get meeting
-            const meetingSnapshot = await admin.database().ref(`meetings/${meetingId}`).once('value');
-            const meeting = meetingSnapshot.val();
+            const meetingRef = admin.database().ref(`${MEETINGS_PATH}/${meetingId}`);
+            const meetingSnapshot = await meetingRef.once('value');
+            const meeting = meetingSnapshot.val() as IMeeting | null;
             if (!meeting) throw new Error('Meeting not found');
 
             const userId = meeting.assignedTo;
             const tokens = await GoogleOAuthService.getUserTokens(userId);
             if (!tokens) {
-                console.log('User not connected to Google, skipping sync');
+                await meetingRef.update({
+                    syncStatus: 'pending',
+                    syncError: 'Google account not connected',
+                    updatedAt: Date.now()
+                });
                 return;
             }
 
-            // Get lead for attendees
-            const leadSnapshot = await admin.database().ref(`leads/${meeting.leadId}`).once('value');
+            const leadSnapshot = await admin.database().ref(`${LEADS_PATH}/${meeting.leadId}`).once('value');
             const lead = leadSnapshot.val();
 
-            // Get user email
-            const userSnapshot = await admin.database().ref(`users/${userId}`).once('value');
+            const userSnapshot = await admin.database().ref(`${USERS_PATH}/${userId}`).once('value');
             const user = userSnapshot.val();
 
-            const attendees = [];
-            if (lead?.email) attendees.push({ email: lead.email });
-            if (user?.email) attendees.push({ email: user.email });
-
-            const eventData: CalendarEventData = {
-                summary: meeting.title,
-                start: {
-                    dateTime: new Date(meeting.from).toISOString(),
-                    timeZone: 'UTC'
-                },
-                end: {
-                    dateTime: new Date(meeting.to).toISOString(),
-                    timeZone: 'UTC'
-                },
-                attendees: attendees
-            };
+            const eventData = buildMeetingEventData(meeting, lead, user);
 
             if (meeting.status === 'Cancelled' && meeting.googleEventId) {
-                // Delete event
                 await GoogleCalendarService.deleteEvent(userId, meeting.googleEventId);
-                await admin.database().ref(`meetings/${meetingId}`).update({
+                await meetingRef.update({
                     googleEventId: null,
+                    googleEventLink: null,
                     meetLink: null,
-                    syncStatus: 'synced',
+                    syncStatus: 'success',
+                    syncError: null,
+                    lastSyncedAt: Date.now(),
                     updatedAt: Date.now()
                 });
             } else if (meeting.googleEventId) {
-                // Update event
-                await GoogleCalendarService.updateEvent(userId, meeting.googleEventId, eventData);
-                await admin.database().ref(`meetings/${meetingId}`).update({
-                    syncStatus: 'synced',
+                const syncResult = await GoogleCalendarService.updateEvent(userId, meeting.googleEventId, eventData);
+                await meetingRef.update({
+                    googleEventLink: syncResult.eventLink || null,
+                    meetLink: syncResult.meetLink || null,
+                    attendees: (meeting.attendees || []).map((attendee) => {
+                        const matchedAttendee = syncResult.attendees?.find(
+                            (calendarAttendee) =>
+                                calendarAttendee.email?.toLowerCase() === attendee.email.toLowerCase()
+                        );
+
+                        return {
+                            ...attendee,
+                            responseStatus: (matchedAttendee?.responseStatus as IMeetingAttendee['responseStatus']) || attendee.responseStatus || 'needsAction'
+                        };
+                    }),
+                    syncStatus: 'success',
+                    syncError: null,
+                    lastSyncedAt: Date.now(),
                     updatedAt: Date.now()
                 });
             } else if (meeting.status === 'Scheduled') {
-                // Create event
-                const { eventId, meetLink } = await GoogleCalendarService.createEvent(userId, eventData);
-                await admin.database().ref(`meetings/${meetingId}`).update({
-                    googleEventId: eventId,
-                    meetLink: meetLink,
-                    syncStatus: 'synced',
+                const syncResult = await GoogleCalendarService.createEvent(userId, eventData);
+                await meetingRef.update({
+                    googleEventId: syncResult.eventId,
+                    googleEventLink: syncResult.eventLink || null,
+                    meetLink: syncResult.meetLink || null,
+                    attendees: (meeting.attendees || []).map((attendee) => {
+                        const matchedAttendee = syncResult.attendees?.find(
+                            (calendarAttendee) =>
+                                calendarAttendee.email?.toLowerCase() === attendee.email.toLowerCase()
+                        );
+
+                        return {
+                            ...attendee,
+                            responseStatus: (matchedAttendee?.responseStatus as IMeetingAttendee['responseStatus']) || attendee.responseStatus || 'needsAction'
+                        };
+                    }),
+                    syncStatus: 'success',
+                    syncError: null,
+                    lastSyncedAt: Date.now(),
                     updatedAt: Date.now()
                 });
             }
         } catch (error) {
             console.error('Sync error:', error);
-            await admin.database().ref(`meetings/${meetingId}`).update({
+            await admin.database().ref(`${MEETINGS_PATH}/${meetingId}`).update({
                 syncStatus: 'failed',
+                syncError: error instanceof Error ? error.message : 'Google Calendar sync failed',
                 updatedAt: Date.now()
             });
         }
+    }
+
+    static async deleteCalendarEventForMeeting(meeting: IMeeting): Promise<void> {
+        if (!meeting.googleEventId) return;
+
+        const tokens = await GoogleOAuthService.getUserTokens(meeting.assignedTo);
+        if (!tokens) return;
+
+        await GoogleCalendarService.deleteEvent(meeting.assignedTo, meeting.googleEventId);
     }
 }
