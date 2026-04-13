@@ -115,28 +115,77 @@ export const getLeads = async (req: AuthRequest, res: Response) => {
 };
 
 // @desc    Create new lead
+// export const createLead = async (req: AuthRequest, res: Response) => {
+//   try {
+//     const leadData: Partial<ILead> = { ...req.body };
+
+//     const phoneNorm = normalizePhonePair(leadData.phoneCountryCode, leadData.phone);
+//     if ("error" in phoneNorm) {
+//         res.status(400).json({ success: false, message: phoneNorm.error });
+//         return;
+//     }
+//     applyNormalizedPhoneToLeadData(leadData, phoneNorm);
+
+//     if (leadData.industry !== undefined && leadData.industry !== null) {
+//         const indNorm = normalizeIndustry(leadData.industry);
+//         if ("error" in indNorm) {
+//             res.status(400).json({ success: false, message: indNorm.error });
+//             return;
+//         }
+//         if (indNorm.industry !== undefined) {
+//             leadData.industry = indNorm.industry;
+//         } else {
+//             delete leadData.industry;
+//         }
+//     }
+
+//     leadData.createdBy = req.user.id;
+//     if (req.user.role !== "admin" || !leadData.assignedTo) {
+//       leadData.assignedTo = req.user.id;
+//     }
+
+//     leadData.timeline = [{
+//         event: "Creation",
+//         performedBy: req.user.id,
+//         remark: req.body.latestRemark || "Lead manually entered into system",
+//         timestamp: Date.now()
+//     }];
+
+//     leadData.status = leadData.status || "Lead Captured";
+//     leadData.createdAt = Date.now();
+//     leadData.updatedAt = Date.now();
+
+//     const newLeadRef = rtdb.ref(LEADS_PATH).push();
+//     await newLeadRef.set(leadData);
+
+//     res.status(201).json({ success: true, data: { _id: newLeadRef.key, ...leadData } });
+//   } catch (error: any) {
+//     res.status(400).json({ success: false, message: error.message });
+//   }
+// };
 export const createLead = async (req: AuthRequest, res: Response) => {
   try {
     const leadData: Partial<ILead> = { ...req.body };
+    const FOLLOW_UP_DELAY_MS = 2 * 60 * 1000;
 
     const phoneNorm = normalizePhonePair(leadData.phoneCountryCode, leadData.phone);
     if ("error" in phoneNorm) {
-        res.status(400).json({ success: false, message: phoneNorm.error });
-        return;
+      res.status(400).json({ success: false, message: phoneNorm.error });
+      return;
     }
     applyNormalizedPhoneToLeadData(leadData, phoneNorm);
 
     if (leadData.industry !== undefined && leadData.industry !== null) {
-        const indNorm = normalizeIndustry(leadData.industry);
-        if ("error" in indNorm) {
-            res.status(400).json({ success: false, message: indNorm.error });
-            return;
-        }
-        if (indNorm.industry !== undefined) {
-            leadData.industry = indNorm.industry;
-        } else {
-            delete leadData.industry;
-        }
+      const indNorm = normalizeIndustry(leadData.industry);
+      if ("error" in indNorm) {
+        res.status(400).json({ success: false, message: indNorm.error });
+        return;
+      }
+      if (indNorm.industry !== undefined) {
+        leadData.industry = indNorm.industry;
+      } else {
+        delete leadData.industry;
+      }
     }
 
     leadData.createdBy = req.user.id;
@@ -144,21 +193,32 @@ export const createLead = async (req: AuthRequest, res: Response) => {
       leadData.assignedTo = req.user.id;
     }
 
+    const now = Date.now();
+
     leadData.timeline = [{
-        event: "Creation",
-        performedBy: req.user.id,
-        remark: req.body.latestRemark || "Lead manually entered into system",
-        timestamp: Date.now()
+      event: "Creation",
+      performedBy: req.user.id,
+      remark: req.body.latestRemark || "Lead manually entered into system",
+      timestamp: now
     }];
 
     leadData.status = leadData.status || "Lead Captured";
-    leadData.createdAt = Date.now();
-    leadData.updatedAt = Date.now();
+    leadData.createdAt = now;
+    leadData.updatedAt = now;
+
+    // Follow-up reminder fields
+    leadData.lastActivityAt = now;
+    leadData.lastReminderAt = null;
+    leadData.followUpReminderCount = 0;
+    leadData.nextReminderDueAt = now + FOLLOW_UP_DELAY_MS;
 
     const newLeadRef = rtdb.ref(LEADS_PATH).push();
     await newLeadRef.set(leadData);
 
-    res.status(201).json({ success: true, data: { _id: newLeadRef.key, ...leadData } });
+    res.status(201).json({
+      success: true,
+      data: { _id: newLeadRef.key, ...leadData }
+    });
   } catch (error: any) {
     res.status(400).json({ success: false, message: error.message });
   }
@@ -266,6 +326,85 @@ export const getLead = async (req: AuthRequest, res: Response) => {
 };
 
 // @desc    Update lead
+// export const updateLead = async (req: AuthRequest, res: Response) => {
+//   try {
+//     const id = req.params.id as string;
+//     const leadRef = rtdb.ref(`${LEADS_PATH}/${id}`);
+//     const snapshot = await leadRef.once("value");
+
+//     if (!snapshot.exists()) {
+//       res.status(404).json({ success: false, message: "Lead not found" });
+//       return;
+//     }
+
+//     const lead = snapshot.val() as ILead;
+
+//     if (lead.assignedTo !== req.user.id && req.user.role !== "admin") {
+//       res.status(403).json({ success: false, message: "Not authorized to update this lead" });
+//       return;
+//     }
+
+//     const updates: any = { ...req.body, updatedAt: Date.now() };
+
+//     const phoneKeysTouched = Object.prototype.hasOwnProperty.call(req.body, "phone")
+//         || Object.prototype.hasOwnProperty.call(req.body, "phoneCountryCode");
+//     if (phoneKeysTouched) {
+//         const mergedCode = updates.phoneCountryCode !== undefined
+//             ? String(updates.phoneCountryCode ?? "").trim()
+//             : String(lead.phoneCountryCode ?? "").trim();
+//         const mergedPhone = updates.phone !== undefined
+//             ? String(updates.phone ?? "").trim()
+//             : String(lead.phone ?? "").trim();
+//         const phoneNorm = normalizePhonePair(mergedCode, mergedPhone);
+//         if ("error" in phoneNorm) {
+//             res.status(400).json({ success: false, message: phoneNorm.error });
+//             return;
+//         }
+//         applyNormalizedPhoneToLeadData(updates, phoneNorm);
+//     } else {
+//         delete updates.phone;
+//         delete updates.phoneCountryCode;
+//     }
+
+//     if (updates.industry !== undefined) {
+//         const indNorm = normalizeIndustry(updates.industry);
+//         if ("error" in indNorm) {
+//             res.status(400).json({ success: false, message: indNorm.error });
+//             return;
+//         }
+//         updates.industry = indNorm.industry;
+//     }
+
+//     const timeline = [...(lead.timeline || [])];
+
+//     if (updates.status && updates.status !== lead.status) {
+//         timeline.push({
+//             event: "Status Changed",
+//             status: updates.status,
+//             remark: updates.latestRemark || `Status updated to ${updates.status}`,
+//             performedBy: req.user.id,
+//             timestamp: Date.now()
+//         });
+//     } else if (updates.latestRemark) {
+//         timeline.push({
+//             event: "Remark Added",
+//             status: lead.status,
+//             remark: updates.latestRemark,
+//             performedBy: req.user.id,
+//             timestamp: Date.now()
+//         });
+//     }
+
+//     updates.timeline = timeline;
+//     delete updates.assignedTo;
+//     delete updates.createdBy;
+
+//     await leadRef.update(updates);
+//     res.status(200).json({ success: true, message: "Lead updated successfully" });
+//   } catch (error: any) {
+//     res.status(400).json({ success: false, message: error.message });
+//   }
+// };
 export const updateLead = async (req: AuthRequest, res: Response) => {
   try {
     const id = req.params.id as string;
@@ -284,55 +423,69 @@ export const updateLead = async (req: AuthRequest, res: Response) => {
       return;
     }
 
-    const updates: any = { ...req.body, updatedAt: Date.now() };
+    const TWO_DAYS_MS = 2 * 24 * 60 * 60 * 1000;
+    const now = Date.now();
+    const updates: any = { ...req.body, updatedAt: now };
 
-    const phoneKeysTouched = Object.prototype.hasOwnProperty.call(req.body, "phone")
-        || Object.prototype.hasOwnProperty.call(req.body, "phoneCountryCode");
+    const phoneKeysTouched =
+      Object.prototype.hasOwnProperty.call(req.body, "phone") ||
+      Object.prototype.hasOwnProperty.call(req.body, "phoneCountryCode");
+
     if (phoneKeysTouched) {
-        const mergedCode = updates.phoneCountryCode !== undefined
-            ? String(updates.phoneCountryCode ?? "").trim()
-            : String(lead.phoneCountryCode ?? "").trim();
-        const mergedPhone = updates.phone !== undefined
-            ? String(updates.phone ?? "").trim()
-            : String(lead.phone ?? "").trim();
-        const phoneNorm = normalizePhonePair(mergedCode, mergedPhone);
-        if ("error" in phoneNorm) {
-            res.status(400).json({ success: false, message: phoneNorm.error });
-            return;
-        }
-        applyNormalizedPhoneToLeadData(updates, phoneNorm);
+      const mergedCode = updates.phoneCountryCode !== undefined
+        ? String(updates.phoneCountryCode ?? "").trim()
+        : String(lead.phoneCountryCode ?? "").trim();
+
+      const mergedPhone = updates.phone !== undefined
+        ? String(updates.phone ?? "").trim()
+        : String(lead.phone ?? "").trim();
+
+      const phoneNorm = normalizePhonePair(mergedCode, mergedPhone);
+      if ("error" in phoneNorm) {
+        res.status(400).json({ success: false, message: phoneNorm.error });
+        return;
+      }
+      applyNormalizedPhoneToLeadData(updates, phoneNorm);
     } else {
-        delete updates.phone;
-        delete updates.phoneCountryCode;
+      delete updates.phone;
+      delete updates.phoneCountryCode;
     }
 
     if (updates.industry !== undefined) {
-        const indNorm = normalizeIndustry(updates.industry);
-        if ("error" in indNorm) {
-            res.status(400).json({ success: false, message: indNorm.error });
-            return;
-        }
-        updates.industry = indNorm.industry;
+      const indNorm = normalizeIndustry(updates.industry);
+      if ("error" in indNorm) {
+        res.status(400).json({ success: false, message: indNorm.error });
+        return;
+      }
+      updates.industry = indNorm.industry;
     }
 
     const timeline = [...(lead.timeline || [])];
+    let meaningfulActivity = false;
 
     if (updates.status && updates.status !== lead.status) {
-        timeline.push({
-            event: "Status Changed",
-            status: updates.status,
-            remark: updates.latestRemark || `Status updated to ${updates.status}`,
-            performedBy: req.user.id,
-            timestamp: Date.now()
-        });
+      timeline.push({
+        event: "Status Changed",
+        status: updates.status,
+        remark: updates.latestRemark || `Status updated to ${updates.status}`,
+        performedBy: req.user.id,
+        timestamp: now
+      });
+      meaningfulActivity = true;
     } else if (updates.latestRemark) {
-        timeline.push({
-            event: "Remark Added",
-            status: lead.status,
-            remark: updates.latestRemark,
-            performedBy: req.user.id,
-            timestamp: Date.now()
-        });
+      timeline.push({
+        event: "Remark Added",
+        status: lead.status,
+        remark: updates.latestRemark,
+        performedBy: req.user.id,
+        timestamp: now
+      });
+      meaningfulActivity = true;
+    }
+
+    if (meaningfulActivity) {
+      updates.lastActivityAt = now;
+      updates.nextReminderDueAt = now + TWO_DAYS_MS;
     }
 
     updates.timeline = timeline;

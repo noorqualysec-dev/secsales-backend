@@ -29,6 +29,11 @@ export interface ILead {
     dealValue?: number; // Estimated value
     createdAt: number;
     updatedAt: number;
+
+    lastActivityAt?: number;          // Last meaningful action on lead
+lastReminderAt?: number | null;         // Last time reminder was sent
+followUpReminderCount?: number;   // How many reminders sent
+nextReminderDueAt?: number;       // Optional: precomputed next reminder time
 }
 
 export const LEAD_SOURCES = [

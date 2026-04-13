@@ -59,11 +59,19 @@ import productivityRoutes from "./routes/productivityRoutes.js";
 import adminRoutes from "./routes/adminRoutes.js";
 import authRoutes from "./routes/authRoutes.js";
 import integrationRoutes from "./routes/integrationRoutes.js";
+import cronRoutes from "./routes/cronRoutes.js";
+import notificationRoutes from "./routes/notificationRoutes.js";
+import { startLeadFollowUpCron } from "./jobs/leadFollowUpCron.js";
 
 // Firebase initialization
 import "./config/firebase.js";
 
 const app = express();
+
+// Start the lead follow-up cron job
+if (process.env.NODE_ENV !== "production") {
+  startLeadFollowUpCron();
+}
 const clientUrl = process.env.FRONTEND_URL || 'http://localhost:3000';
 
 // Enable CORS
@@ -192,6 +200,8 @@ app.use("/api/productivity", productivityRoutes);
 app.use("/api/admin", adminRoutes);
 app.use("/api/auth", authRoutes);
 app.use("/api/integrations", integrationRoutes);
+app.use("/api/cron", cronRoutes);
+app.use("/api/notifications", notificationRoutes);
 
 // ❗ IMPORTANT: NO app.listen here
 
