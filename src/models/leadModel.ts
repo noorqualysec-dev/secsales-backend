@@ -6,6 +6,40 @@ export interface ITimelineEvent {
     timestamp: number;
 }
 
+export interface LeadContact {
+    id: string;
+    firstName: string;
+    lastName: string;
+    fullName?: string; // optional computed/helper field
+    email: string;
+    phone?: string;
+    phoneCountryCode?: string;
+    designation?: string;
+    department?: string;
+
+    isPrimary?: boolean;
+    isDecisionMaker?: boolean;
+    isInfluencer?: boolean;
+    isTechnicalContact?: boolean;
+    isBillingContact?: boolean;
+
+    linkedinUrl?: string;
+    notes?: string;
+    source?: string; // referral, website, event, manual, etc.
+
+    addedAt: number;
+    updatedAt: number;
+    addedBy: string;
+
+    lastContactedAt?: number;
+    nextFollowUpAt?: number;
+    contactStatus?: "active" | "inactive" | "unresponsive" | "left_company";
+
+    preferredChannel?: "email" | "phone" | "whatsapp" | "linkedin";
+    employmentStage?: "current" | "joining_soon" | "newly_joined";
+    joinedOn?: number;
+}
+
 export interface ILead {
     id?: string;
     firstName: string;
@@ -29,11 +63,20 @@ export interface ILead {
     dealValue?: number; // Estimated value
     createdAt: number;
     updatedAt: number;
+    contacts?: LeadContact[];
+    primaryContactId?: string;
 
     lastActivityAt?: number;          // Last meaningful action on lead
 lastReminderAt?: number | null;         // Last time reminder was sent
 followUpReminderCount?: number;   // How many reminders sent
-nextReminderDueAt?: number;       // Optional: precomputed next reminder time
+    nextReminderDueAt?: number;       // Optional: precomputed next reminder time
+
+    companyInsights?: {
+        hiringSignal?: string;
+        recentTrigger?: string;
+        nextOpportunity?: string;
+        accountNotes?: string;
+    };
 }
 
 export const LEAD_SOURCES = [

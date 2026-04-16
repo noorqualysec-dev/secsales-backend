@@ -1,7 +1,8 @@
 import type { Response } from "express";
 import { rtdb } from "../config/firebase.js";
 import type { AuthRequest } from "../middleware/authMiddleware.js";
-import type { ILead } from "../models/leadModel.js";
+import type { ILead, LeadContact } from "../models/leadModel.js";
+import { v4 as uuidv4 } from "uuid";
 
 const LEADS_PATH = "leads";
 const USERS_PATH = "users";
@@ -9,6 +10,15 @@ const PROPOSALS_PATH = "proposals";
 
 const DIAL_CODE_RE = /^\+\d{1,4}$/;
 const NATIONAL_PHONE_RE = /^\d{4,15}$/;
+const COMPANY_KEY_RE = /[^a-z0-9]+/g;
+
+function normalizeCompanyName(value: unknown): string {
+    return String(value ?? "").trim().replace(/\s+/g, " ");
+}
+
+function companyToKey(company: string): string {
+    return company.trim().toLowerCase().replace(COMPANY_KEY_RE, "-").replace(/^-+|-+$/g, "");
+}
 
 /** When both inputs empty after trim, returns empty strings (clear phone). Otherwise validates pair. */
 function normalizePhonePair(
@@ -55,6 +65,142 @@ function applyNormalizedPhoneToLeadData(leadData: Partial<ILead>, norm: { phoneC
         leadData.phoneCountryCode = norm.phoneCountryCode;
         leadData.phone = norm.phone;
     }
+}
+
+function normalizeShortText(value: unknown, max = 160): string | undefined {
+    const cleaned = String(value ?? "").trim();
+    if (!cleaned) return undefined;
+    return cleaned.slice(0, max);
+}
+
+function normalizeLongText(value: unknown, max = 1000): string | undefined {
+    const cleaned = String(value ?? "").trim();
+    if (!cleaned) return undefined;
+    return cleaned.slice(0, max);
+}
+
+function normalizeCompanyInsights(raw: unknown): ILead["companyInsights"] | undefined {
+    if (!raw || typeof raw !== "object") {
+        return undefined;
+    }
+
+    const record = raw as Record<string, unknown>;
+    const hiringSignal = normalizeShortText(record.hiringSignal, 180);
+    const recentTrigger = normalizeShortText(record.recentTrigger, 180);
+    const nextOpportunity = normalizeShortText(record.nextOpportunity, 180);
+    const accountNotes = normalizeLongText(record.accountNotes, 1500);
+
+    const insights: NonNullable<ILead["companyInsights"]> = {};
+    if (hiringSignal) insights.hiringSignal = hiringSignal;
+    if (recentTrigger) insights.recentTrigger = recentTrigger;
+    if (nextOpportunity) insights.nextOpportunity = nextOpportunity;
+    if (accountNotes) insights.accountNotes = accountNotes;
+
+    return Object.keys(insights).length ? insights : undefined;
+}
+
+function normalizeContact(raw: unknown, fallbackUserId: string): LeadContact | null {
+    if (!raw || typeof raw !== "object") {
+        return null;
+    }
+
+    const contact = raw as Record<string, unknown>;
+    const firstName = String(contact.firstName ?? "").trim();
+    const lastName = String(contact.lastName ?? "").trim();
+    const email = String(contact.email ?? "").trim().toLowerCase();
+
+    if (!firstName || !email) {
+        return null;
+    }
+
+    const phoneNorm = normalizePhonePair(contact.phoneCountryCode, contact.phone);
+    if ("error" in phoneNorm) {
+        throw new Error(`Invalid phone for contact ${email}: ${phoneNorm.error}`);
+    }
+
+    const fullName = `${firstName} ${lastName}`.trim();
+    const normalized: LeadContact = {
+        id: String(contact.id ?? "").trim() || uuidv4(),
+        firstName,
+        lastName,
+        fullName,
+        email,
+        addedAt: Number(contact.addedAt) || Date.now(),
+        updatedAt: Date.now(),
+        addedBy: String(contact.addedBy ?? "").trim() || fallbackUserId,
+        isPrimary: Boolean(contact.isPrimary),
+        isDecisionMaker: Boolean(contact.isDecisionMaker),
+        isInfluencer: Boolean(contact.isInfluencer),
+        isTechnicalContact: Boolean(contact.isTechnicalContact),
+        isBillingContact: Boolean(contact.isBillingContact),
+    };
+
+    if (phoneNorm.phone) normalized.phone = phoneNorm.phone;
+    if (phoneNorm.phoneCountryCode) normalized.phoneCountryCode = phoneNorm.phoneCountryCode;
+
+    const designation = normalizeShortText(contact.designation);
+    const department = normalizeShortText(contact.department);
+    const linkedinUrl = normalizeShortText(contact.linkedinUrl, 300);
+    const notes = normalizeLongText(contact.notes);
+    const source = normalizeShortText(contact.source);
+    const joinedOn = Number(contact.joinedOn) || undefined;
+    const lastContactedAt = Number(contact.lastContactedAt) || undefined;
+    const nextFollowUpAt = Number(contact.nextFollowUpAt) || undefined;
+    const contactStatus = ["active", "inactive", "unresponsive", "left_company"].includes(String(contact.contactStatus ?? ""))
+        ? (contact.contactStatus as LeadContact["contactStatus"])
+        : undefined;
+    const preferredChannel = ["email", "phone", "whatsapp", "linkedin"].includes(String(contact.preferredChannel ?? ""))
+        ? (contact.preferredChannel as LeadContact["preferredChannel"])
+        : undefined;
+    const employmentStage = ["current", "joining_soon", "newly_joined"].includes(String(contact.employmentStage ?? ""))
+        ? (contact.employmentStage as LeadContact["employmentStage"])
+        : undefined;
+
+    if (designation) normalized.designation = designation;
+    if (department) normalized.department = department;
+    if (linkedinUrl) normalized.linkedinUrl = linkedinUrl;
+    if (notes) normalized.notes = notes;
+    if (source) normalized.source = source;
+    if (contactStatus) normalized.contactStatus = contactStatus;
+    if (preferredChannel) normalized.preferredChannel = preferredChannel;
+    if (employmentStage) normalized.employmentStage = employmentStage;
+    if (joinedOn) normalized.joinedOn = joinedOn;
+    if (lastContactedAt) normalized.lastContactedAt = lastContactedAt;
+    if (nextFollowUpAt) normalized.nextFollowUpAt = nextFollowUpAt;
+
+    return normalized;
+}
+
+function normalizeContacts(raw: unknown, fallbackUserId: string): LeadContact[] | undefined {
+    if (!Array.isArray(raw)) {
+        return undefined;
+    }
+
+    const contacts = raw
+        .map((item) => normalizeContact(item, fallbackUserId))
+        .filter((item): item is LeadContact => Boolean(item));
+
+    return contacts.length ? contacts : [];
+}
+
+function buildPrimaryContactFromLead(leadId: string, lead: ILead) {
+    const fullName = `${lead.firstName || ""} ${lead.lastName || ""}`.trim();
+    return {
+        contactId: `lead-${leadId}`,
+        leadId,
+        fullName,
+        firstName: lead.firstName || "",
+        lastName: lead.lastName || "",
+        email: lead.email || "",
+        designation: lead.designation || "",
+        phone: lead.phone || "",
+        phoneCountryCode: lead.phoneCountryCode || "",
+        status: lead.status,
+        createdAt: lead.createdAt || 0,
+        updatedAt: lead.updatedAt || 0,
+        source: lead.source || "",
+        type: "lead",
+    };
 }
 
 // Helper for manual "population"
@@ -109,6 +255,162 @@ export const getLeads = async (req: AuthRequest, res: Response) => {
     leads.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
 
     res.status(200).json({ success: true, count: leads.length, data: leads });
+  } catch (error: any) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+export const getCompanies = async (req: AuthRequest, res: Response) => {
+  try {
+    const snapshot = req.user.role !== "admin"
+      ? await rtdb.ref(LEADS_PATH).orderByChild("assignedTo").equalTo(req.user.id).once("value")
+      : await rtdb.ref(LEADS_PATH).orderByChild("createdAt").once("value");
+
+    if (!snapshot.exists()) {
+      res.status(200).json({ success: true, count: 0, data: [] });
+      return;
+    }
+
+    const companies = new Map<string, any>();
+    const leadsData = snapshot.val() as Record<string, ILead>;
+
+    for (const [leadId, lead] of Object.entries(leadsData)) {
+      const companyName = normalizeCompanyName(lead.company);
+      if (!companyName) continue;
+
+      const key = companyToKey(companyName);
+      const existing = companies.get(key) || {
+        key,
+        name: companyName,
+        industry: lead.industry || "",
+        country: lead.country || "",
+        employeeStrength: lead.employeeStrength || "",
+        leadCount: 0,
+        memberCount: 0,
+        openOpportunities: 0,
+        lastUpdatedAt: 0,
+        owners: new Map<string, string>(),
+      };
+
+      existing.leadCount += 1;
+      existing.memberCount += 1 + (lead.contacts?.length || 0);
+      if (lead.status !== "Won" && lead.status !== "Lost") {
+        existing.openOpportunities += 1;
+      }
+      existing.lastUpdatedAt = Math.max(existing.lastUpdatedAt, lead.updatedAt || lead.createdAt || 0);
+      if (!existing.industry && lead.industry) existing.industry = lead.industry;
+      if (!existing.country && lead.country) existing.country = lead.country;
+      if (!existing.employeeStrength && lead.employeeStrength) existing.employeeStrength = lead.employeeStrength;
+      if (lead.assignedTo) {
+        const owner = await populateUser(lead.assignedTo);
+        if (owner?._id) {
+          existing.owners.set(owner._id, owner.name || owner.email || "Unknown");
+        }
+      }
+
+      companies.set(key, existing);
+    }
+
+    const data = Array.from(companies.values())
+      .map((item) => ({
+        key: item.key,
+        name: item.name,
+        industry: item.industry || undefined,
+        country: item.country || undefined,
+        employeeStrength: item.employeeStrength || undefined,
+        leadCount: item.leadCount,
+        memberCount: item.memberCount,
+        openOpportunities: item.openOpportunities,
+        lastUpdatedAt: item.lastUpdatedAt,
+        owners: Array.from(item.owners.entries() as Iterable<[string, string]>).map(([id, name]) => ({ _id: id, name })),
+      }))
+      .sort((a, b) => b.lastUpdatedAt - a.lastUpdatedAt || a.name.localeCompare(b.name));
+
+    res.status(200).json({ success: true, count: data.length, data });
+  } catch (error: any) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+export const getCompanyDetails = async (req: AuthRequest, res: Response) => {
+  try {
+    const companyKey = String(req.params.companyKey || "").trim().toLowerCase();
+    if (!companyKey) {
+      res.status(400).json({ success: false, message: "Company key is required" });
+      return;
+    }
+
+    const snapshot = req.user.role !== "admin"
+      ? await rtdb.ref(LEADS_PATH).orderByChild("assignedTo").equalTo(req.user.id).once("value")
+      : await rtdb.ref(LEADS_PATH).orderByChild("createdAt").once("value");
+
+    if (!snapshot.exists()) {
+      res.status(404).json({ success: false, message: "Company not found" });
+      return;
+    }
+
+    const leadsData = snapshot.val() as Record<string, ILead>;
+    const matching = Object.entries(leadsData).filter(([, lead]) => companyToKey(normalizeCompanyName(lead.company)) === companyKey);
+
+    if (!matching.length) {
+      res.status(404).json({ success: false, message: "Company not found" });
+      return;
+    }
+
+    const leads = await Promise.all(matching.map(async ([leadId, lead]) => ({
+      _id: leadId,
+      ...lead,
+      assignedTo: await populateUser(lead.assignedTo || ""),
+      createdBy: await populateUser(lead.createdBy || ""),
+      members: [
+        buildPrimaryContactFromLead(leadId, lead),
+        ...((lead.contacts || []).map((contact) => ({
+          contactId: contact.id,
+          leadId,
+          fullName: contact.fullName || `${contact.firstName} ${contact.lastName}`.trim(),
+          firstName: contact.firstName,
+          lastName: contact.lastName,
+          email: contact.email,
+          designation: contact.designation || "",
+          department: contact.department || "",
+          phone: contact.phone || "",
+          phoneCountryCode: contact.phoneCountryCode || "",
+          status: contact.contactStatus || "active",
+          source: contact.source || "",
+          type: "contact",
+          preferredChannel: contact.preferredChannel,
+          employmentStage: contact.employmentStage,
+          joinedOn: contact.joinedOn,
+          notes: contact.notes || "",
+          updatedAt: contact.updatedAt || lead.updatedAt || lead.createdAt || 0,
+          createdAt: contact.addedAt || lead.createdAt || 0,
+        }))),
+      ],
+    })));
+
+    leads.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+    const baseLead = leads[0];
+    if (!baseLead) {
+      res.status(404).json({ success: false, message: "Company not found" });
+      return;
+    }
+    const members = leads
+      .flatMap((lead) => lead.members)
+      .sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+
+    res.status(200).json({
+      success: true,
+      data: {
+        key: companyKey,
+        name: normalizeCompanyName(baseLead.company),
+        industry: baseLead.industry || undefined,
+        country: baseLead.country || undefined,
+        employeeStrength: baseLead.employeeStrength || undefined,
+        companyInsights: baseLead.companyInsights || undefined,
+        leads,
+        members,
+      },
+    });
   } catch (error: any) {
     res.status(500).json({ success: false, message: error.message });
   }
@@ -187,6 +489,12 @@ export const createLead = async (req: AuthRequest, res: Response) => {
         delete leadData.industry;
       }
     }
+
+    leadData.company = normalizeCompanyName(leadData.company);
+    const normalizedContacts = normalizeContacts(req.body.contacts, req.user.id);
+    const normalizedCompanyInsights = normalizeCompanyInsights(req.body.companyInsights);
+    if (normalizedContacts !== undefined) leadData.contacts = normalizedContacts;
+    if (normalizedCompanyInsights !== undefined) leadData.companyInsights = normalizedCompanyInsights;
 
     leadData.createdBy = req.user.id;
     if (req.user.role !== "admin" || !leadData.assignedTo) {
@@ -458,6 +766,20 @@ export const updateLead = async (req: AuthRequest, res: Response) => {
         return;
       }
       updates.industry = indNorm.industry;
+    }
+
+    if (Object.prototype.hasOwnProperty.call(req.body, "company")) {
+      updates.company = normalizeCompanyName(req.body.company);
+    }
+
+    if (Object.prototype.hasOwnProperty.call(req.body, "contacts")) {
+      const normalizedContacts = normalizeContacts(req.body.contacts, req.user.id);
+      updates.contacts = normalizedContacts ?? [];
+    }
+
+    if (Object.prototype.hasOwnProperty.call(req.body, "companyInsights")) {
+      const normalizedCompanyInsights = normalizeCompanyInsights(req.body.companyInsights);
+      updates.companyInsights = normalizedCompanyInsights ?? null;
     }
 
     const timeline = [...(lead.timeline || [])];
