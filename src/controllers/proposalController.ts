@@ -2,10 +2,21 @@ import type { Response } from "express";
 import { rtdb } from "../config/firebase.js";
 import type { AuthRequest } from "../middleware/authMiddleware.js";
 import type { IProposal } from "../models/proposalModel.js";
+import type { ILead, LeadOutcome, LeadStatus } from "../models/leadModel.js";
 
 const PROPOSALS_PATH = "proposals";
 const LEADS_PATH = "leads";
 const USERS_PATH = "users";
+const CLOSED_STATUSES = new Set(["Won", "Lost"]);
+
+const getLeadStage = (lead: Partial<ILead>): LeadStatus => {
+    if (lead.status && !CLOSED_STATUSES.has(lead.status)) {
+        return lead.status;
+    }
+    if (lead.lostAtStatus) return lead.lostAtStatus;
+    if (lead.wonAtStatus) return lead.wonAtStatus;
+    return "Lead Captured";
+};
 
 // Helper for manual "population"
 const populateRef = async (path: string, id: string, fields: string[]) => {
@@ -97,14 +108,46 @@ export const createProposal = async (req: AuthRequest, res: Response) => {
         const newLeadStatus = leadStatusMap[proposalData.status];
         if (newLeadStatus && newLeadStatus !== leadData.status) {
             const timeline = [...(leadData.timeline || [])];
-            timeline.push({
-                event: "Status Changed",
-                status: newLeadStatus,
-                remark: `Status updated to ${newLeadStatus} via Proposal`,
-                performedBy: req.user.id,
-                timestamp: Date.now()
-            });
-            await leadRef.update({ status: newLeadStatus, timeline, updatedAt: Date.now() });
+            const now = Date.now();
+            if (newLeadStatus === "Won" || newLeadStatus === "Lost") {
+                const stageAtClosure = getLeadStage(leadData);
+                const outcome: LeadOutcome = newLeadStatus === "Won" ? "won" : "lost";
+                timeline.push({
+                    event: newLeadStatus,
+                    status: stageAtClosure,
+                    previousStatus: stageAtClosure,
+                    outcome,
+                    remark: `Lead marked ${outcome} at ${stageAtClosure} via Proposal`,
+                    performedBy: req.user.id,
+                    timestamp: now
+                });
+                await leadRef.update({
+                    status: stageAtClosure,
+                    outcome,
+                    wonAtStatus: outcome === "won" ? stageAtClosure : null,
+                    lostAtStatus: outcome === "lost" ? stageAtClosure : null,
+                    closedAt: now,
+                    wasEverWon: outcome === "won" ? true : leadData.wasEverWon || false,
+                    timeline,
+                    updatedAt: now
+                });
+            } else {
+                timeline.push({
+                    event: "Status Changed",
+                    status: newLeadStatus,
+                    previousStatus: getLeadStage(leadData),
+                    outcome: "open",
+                    remark: `Status updated to ${newLeadStatus} via Proposal`,
+                    performedBy: req.user.id,
+                    timestamp: now
+                });
+                await leadRef.update({
+                    status: newLeadStatus,
+                    outcome: "open",
+                    timeline,
+                    updatedAt: now
+                });
+            }
         }
     }
 
@@ -181,18 +224,50 @@ export const updateProposal = async (req: AuthRequest, res: Response) => {
         if (newLeadStatus) {
             const leadRef = rtdb.ref(`${LEADS_PATH}/${proposal.lead}`);
             const leadSnap = await leadRef.once("value");
-            const leadData = leadSnap.val();
+            const leadData = leadSnap.val() as ILead;
 
             if (leadData && leadData.status !== newLeadStatus) {
                 const timeline = [...(leadData.timeline || [])];
-                timeline.push({
-                    event: "Status Changed",
-                    status: newLeadStatus,
-                    remark: `Status updated to ${newLeadStatus} via Proposal update`,
-                    performedBy: req.user.id,
-                    timestamp: Date.now()
-                });
-                await leadRef.update({ status: newLeadStatus, timeline, updatedAt: Date.now() });
+                const now = Date.now();
+                if (newLeadStatus === "Won" || newLeadStatus === "Lost") {
+                    const stageAtClosure = getLeadStage(leadData);
+                    const outcome: LeadOutcome = newLeadStatus === "Won" ? "won" : "lost";
+                    timeline.push({
+                        event: newLeadStatus,
+                        status: stageAtClosure,
+                        previousStatus: stageAtClosure,
+                        outcome,
+                        remark: `Lead marked ${outcome} at ${stageAtClosure} via Proposal update`,
+                        performedBy: req.user.id,
+                        timestamp: now
+                    });
+                    await leadRef.update({
+                        status: stageAtClosure,
+                        outcome,
+                        wonAtStatus: outcome === "won" ? stageAtClosure : null,
+                        lostAtStatus: outcome === "lost" ? stageAtClosure : null,
+                        closedAt: now,
+                        wasEverWon: outcome === "won" ? true : leadData.wasEverWon || false,
+                        timeline,
+                        updatedAt: now
+                    });
+                } else {
+                    timeline.push({
+                        event: "Status Changed",
+                        status: newLeadStatus as LeadStatus,
+                        previousStatus: getLeadStage(leadData),
+                        outcome: "open",
+                        remark: `Status updated to ${newLeadStatus} via Proposal update`,
+                        performedBy: req.user.id,
+                        timestamp: now
+                    });
+                    await leadRef.update({
+                        status: newLeadStatus,
+                        outcome: "open",
+                        timeline,
+                        updatedAt: now
+                    });
+                }
             }
         }
     }

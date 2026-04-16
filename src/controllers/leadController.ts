@@ -1,7 +1,8 @@
 import type { Response } from "express";
 import { rtdb } from "../config/firebase.js";
 import type { AuthRequest } from "../middleware/authMiddleware.js";
-import type { ILead, LeadContact } from "../models/leadModel.js";
+import { LEAD_REGIONS } from "../models/leadModel.js";
+import type { ILead, LeadContact, LeadOutcome, LeadStatus, LeadRegion } from "../models/leadModel.js";
 import { v4 as uuidv4 } from "uuid";
 
 const LEADS_PATH = "leads";
@@ -11,6 +12,18 @@ const PROPOSALS_PATH = "proposals";
 const DIAL_CODE_RE = /^\+\d{1,4}$/;
 const NATIONAL_PHONE_RE = /^\d{4,15}$/;
 const COMPANY_KEY_RE = /[^a-z0-9]+/g;
+const CLOSED_OUTCOME_STATUSES = new Set(["Won", "Lost"]);
+const LEGACY_OPEN_STATUSES = new Set([
+    "Lead Captured",
+    "Discovery Call Scheduled",
+    "Requirement Gathering",
+    "Pre-Assessment Form Sent",
+    "Proposal Preparation",
+    "Proposal Sent",
+    "Negotiation",
+]);
+const VALID_OUTCOMES = new Set<LeadOutcome>(["open", "won", "lost", "cancelled"]);
+const VALID_REGIONS = new Set<string>(LEAD_REGIONS);
 
 function normalizeCompanyName(value: unknown): string {
     return String(value ?? "").trim().replace(/\s+/g, " ");
@@ -183,6 +196,36 @@ function normalizeContacts(raw: unknown, fallbackUserId: string): LeadContact[] 
     return contacts.length ? contacts : [];
 }
 
+function normalizeRegion(regionRaw: unknown): { error: string } | { region: LeadRegion | undefined } {
+    if (regionRaw === undefined || regionRaw === null || String(regionRaw).trim() === "") {
+        return { region: undefined };
+    }
+    const region = String(regionRaw).trim();
+    if (!VALID_REGIONS.has(region)) {
+        return { error: "Invalid region selected." };
+    }
+    return { region: region as LeadRegion };
+}
+
+function getEffectiveLeadOutcome(lead: Partial<ILead>): LeadOutcome {
+    if (lead.outcome && VALID_OUTCOMES.has(lead.outcome)) {
+        return lead.outcome;
+    }
+    const status = String(lead.status ?? "");
+    if (status === "Won") return "won";
+    if (status === "Lost") return "lost";
+    return "open";
+}
+
+function getLatestActiveStage(lead: Partial<ILead>): LeadStatus {
+    if (lead.status && !CLOSED_OUTCOME_STATUSES.has(lead.status)) {
+        return lead.status;
+    }
+    if (lead.lostAtStatus) return lead.lostAtStatus;
+    if (lead.wonAtStatus) return lead.wonAtStatus;
+    return "Lead Captured";
+}
+
 function buildPrimaryContactFromLead(leadId: string, lead: ILead) {
     const fullName = `${lead.firstName || ""} ${lead.lastName || ""}`.trim();
     return {
@@ -294,7 +337,7 @@ export const getCompanies = async (req: AuthRequest, res: Response) => {
 
       existing.leadCount += 1;
       existing.memberCount += 1 + (lead.contacts?.length || 0);
-      if (lead.status !== "Won" && lead.status !== "Lost") {
+      if (getEffectiveLeadOutcome(lead) === "open") {
         existing.openOpportunities += 1;
       }
       existing.lastUpdatedAt = Math.max(existing.lastUpdatedAt, lead.updatedAt || lead.createdAt || 0);
@@ -490,6 +533,19 @@ export const createLead = async (req: AuthRequest, res: Response) => {
       }
     }
 
+    if (Object.prototype.hasOwnProperty.call(leadData, "region")) {
+      const regionNorm = normalizeRegion(leadData.region);
+      if ("error" in regionNorm) {
+        res.status(400).json({ success: false, message: regionNorm.error });
+        return;
+      }
+      if (regionNorm.region !== undefined) {
+        leadData.region = regionNorm.region;
+      } else {
+        delete leadData.region;
+      }
+    }
+
     leadData.company = normalizeCompanyName(leadData.company);
     const normalizedContacts = normalizeContacts(req.body.contacts, req.user.id);
     const normalizedCompanyInsights = normalizeCompanyInsights(req.body.companyInsights);
@@ -511,6 +567,7 @@ export const createLead = async (req: AuthRequest, res: Response) => {
     }];
 
     leadData.status = leadData.status || "Lead Captured";
+    leadData.outcome = "open";
     leadData.createdAt = now;
     leadData.updatedAt = now;
 
@@ -570,8 +627,12 @@ export const bulkImportLeads = async (req: AuthRequest, res: Response) => {
         company:          row.company   || "",
         industry:         row.industry  || "",
         country:          row.country   || "",
+        region:           VALID_REGIONS.has(String(row.region ?? "").trim()) ? String(row.region).trim() : undefined,
         employeeStrength: row.employeeStrength || "",
-        status:           VALID_STATUSES.includes(row.status) ? row.status : "Lead Captured",
+        status:           LEGACY_OPEN_STATUSES.has(row.status) ? row.status : "Lead Captured",
+        outcome:          row.status === "Won" ? "won" : row.status === "Lost" ? "lost" : "open",
+        wonAtStatus:      row.status === "Won" ? "Negotiation" : undefined,
+        lostAtStatus:     row.status === "Lost" ? "Negotiation" : undefined,
         source:           VALID_SOURCES.includes(row.source)  ? row.source  : "other",
         dealValue:        Number(row.dealValue) || 0,
         closingDate:      Number(row.closingDate) || 0,
@@ -584,6 +645,7 @@ export const bulkImportLeads = async (req: AuthRequest, res: Response) => {
           remark: "Imported via CSV",
           timestamp: Date.now()
         }],
+        closedAt:         row.status === "Won" || row.status === "Lost" ? Date.now() : undefined,
         createdAt: Date.now(),
         updatedAt: Date.now()
       });
@@ -734,6 +796,8 @@ export const updateLead = async (req: AuthRequest, res: Response) => {
     const TWO_DAYS_MS = 2 * 24 * 60 * 60 * 1000;
     const now = Date.now();
     const updates: any = { ...req.body, updatedAt: now };
+    const currentOutcome = getEffectiveLeadOutcome(lead);
+    const currentStage = getLatestActiveStage(lead);
 
     const phoneKeysTouched =
       Object.prototype.hasOwnProperty.call(req.body, "phone") ||
@@ -768,6 +832,15 @@ export const updateLead = async (req: AuthRequest, res: Response) => {
       updates.industry = indNorm.industry;
     }
 
+    if (Object.prototype.hasOwnProperty.call(req.body, "region")) {
+      const regionNorm = normalizeRegion(req.body.region);
+      if ("error" in regionNorm) {
+        res.status(400).json({ success: false, message: regionNorm.error });
+        return;
+      }
+      updates.region = regionNorm.region ?? null;
+    }
+
     if (Object.prototype.hasOwnProperty.call(req.body, "company")) {
       updates.company = normalizeCompanyName(req.body.company);
     }
@@ -784,20 +857,102 @@ export const updateLead = async (req: AuthRequest, res: Response) => {
 
     const timeline = [...(lead.timeline || [])];
     let meaningfulActivity = false;
+    let nextStage = currentStage;
+    let nextOutcome = currentOutcome;
 
-    if (updates.status && updates.status !== lead.status) {
+    if (typeof updates.outcome === "string") {
+      const normalizedOutcome = updates.outcome.trim().toLowerCase() as LeadOutcome;
+      if (!VALID_OUTCOMES.has(normalizedOutcome)) {
+        res.status(400).json({ success: false, message: "Invalid lead outcome." });
+        return;
+      }
+      nextOutcome = normalizedOutcome;
+    }
+
+    const requestedStatus = typeof updates.status === "string" ? updates.status.trim() : "";
+    const wantsLegacyLost = requestedStatus === "Lost";
+    const wantsLegacyWon = requestedStatus === "Won";
+    const wantsStageChange = requestedStatus.length > 0 && !CLOSED_OUTCOME_STATUSES.has(requestedStatus);
+
+    if (wantsStageChange && !LEGACY_OPEN_STATUSES.has(requestedStatus)) {
+      res.status(400).json({ success: false, message: "Invalid lead status." });
+      return;
+    }
+
+    if (wantsLegacyLost) {
+      nextOutcome = "lost";
+      delete updates.status;
+    } else if (wantsLegacyWon) {
+      nextOutcome = "won";
+      delete updates.status;
+    } else if (wantsStageChange) {
+      nextStage = requestedStatus as LeadStatus;
+    }
+
+    if (nextOutcome === "open" && currentOutcome !== "open") {
+      updates.lostAtStatus = null;
+      updates.wonAtStatus = null;
+      updates.closedAt = null;
+      timeline.push({
+        event: "Reopened",
+        status: nextStage,
+        previousStatus: currentStage,
+        outcome: nextOutcome,
+        remark: updates.latestRemark || `Lead reopened at ${nextStage}`,
+        performedBy: req.user.id,
+        timestamp: now,
+      });
+      meaningfulActivity = true;
+    }
+
+    if (wantsStageChange && nextStage !== currentStage) {
       timeline.push({
         event: "Status Changed",
-        status: updates.status,
-        remark: updates.latestRemark || `Status updated to ${updates.status}`,
+        status: nextStage,
+        previousStatus: currentStage,
+        outcome: nextOutcome,
+        remark: updates.latestRemark || `Status updated to ${nextStage}`,
         performedBy: req.user.id,
         timestamp: now
       });
       meaningfulActivity = true;
+    }
+
+    if (nextOutcome !== currentOutcome && nextOutcome !== "open") {
+      const stageAtClosure = nextStage;
+      const event = nextOutcome === "won" ? "Won" : nextOutcome === "lost" ? "Lost" : "Cancelled";
+      timeline.push({
+        event,
+        status: stageAtClosure,
+        previousStatus: currentStage,
+        outcome: nextOutcome,
+        reason: nextOutcome === "won"
+          ? updates.wonReason
+          : nextOutcome === "lost"
+            ? updates.lostReason
+            : updates.cancellationReason,
+        remark: updates.latestRemark || `Lead marked ${nextOutcome} at ${stageAtClosure}`,
+        performedBy: req.user.id,
+        timestamp: now
+      });
+      meaningfulActivity = true;
+      updates.closedAt = now;
+      if (nextOutcome === "won") {
+        updates.wonAtStatus = stageAtClosure;
+        updates.lostAtStatus = null;
+        updates.wasEverWon = true;
+      } else if (nextOutcome === "lost") {
+        updates.lostAtStatus = stageAtClosure;
+        updates.wonAtStatus = null;
+      } else {
+        updates.wonAtStatus = null;
+        updates.lostAtStatus = null;
+      }
     } else if (updates.latestRemark) {
       timeline.push({
         event: "Remark Added",
-        status: lead.status,
+        status: nextStage,
+        outcome: nextOutcome,
         remark: updates.latestRemark,
         performedBy: req.user.id,
         timestamp: now
@@ -810,6 +965,8 @@ export const updateLead = async (req: AuthRequest, res: Response) => {
       updates.nextReminderDueAt = now + TWO_DAYS_MS;
     }
 
+    updates.status = nextStage;
+    updates.outcome = nextOutcome;
     updates.timeline = timeline;
     delete updates.assignedTo;
     delete updates.createdBy;

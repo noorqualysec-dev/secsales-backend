@@ -93,6 +93,15 @@ import { createNotification } from "../utils/notification.js";
 import type { ILead } from "../models/leadModel.js";
 
 const LEADS_PATH = "leads";
+const getLeadOutcome = (lead: Partial<ILead>) => {
+  if (lead.outcome === "won" || lead.outcome === "lost" || lead.outcome === "cancelled") {
+    return lead.outcome;
+  }
+  const status = String(lead.status ?? "");
+  if (status === "Won") return "won";
+  if (status === "Lost") return "lost";
+  return "open";
+};
 
 export const processLeadFollowUpReminders = async () => {
   const now = Date.now();
@@ -121,7 +130,7 @@ export const processLeadFollowUpReminders = async () => {
       continue;
     }
 
-    if (lead.status === "Won" || lead.status === "Lost") {
+    if (getLeadOutcome(lead) !== "open") {
       skipped++;
       continue;
     }

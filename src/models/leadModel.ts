@@ -1,10 +1,22 @@
 export interface ITimelineEvent {
-    event: "Creation" | "Status Changed" | "Remark Added" | "Assigned" | "Won" | "Lost";
-    status?: string;
+    event: "Creation" | "Status Changed" | "Remark Added" | "Assigned" | "Won" | "Lost" | "Cancelled" | "Reopened";
+    status?: LeadStatus;
+     previousStatus?: LeadStatus;
+    outcome?: LeadOutcome;
     remark?: string;
+    reason?: string;
     performedBy: string; // User ID
     timestamp: number;
 }
+
+export const LEAD_REGIONS = [
+    "India",
+    "Middle-East",
+    "North-America",
+    "SouthEast-Asia",
+    "Australia",
+    "South-America"
+] as const;
 
 export interface LeadContact {
     id: string;
@@ -52,8 +64,23 @@ export interface ILead {
     phoneCountryCode?: string;
     company?: string;
     country?: string;
+    region?: LeadRegion;
     industry?: string;
-    status: string;
+    status: LeadStatus;
+    // overall result of lead
+    outcome: LeadOutcome;
+    // tracking where lead was closed
+    lostAtStatus?: LeadStatus;
+    wonAtStatus?: LeadStatus;
+    closedAt?: number;
+
+    // reasons
+    lostReason?: string;
+    wonReason?: string;
+    cancellationReason?: string;
+
+    // special business case
+    wasEverWon?: boolean;
     latestRemark?: string;
     source: string;
     assignedTo?: string; // User ID
@@ -95,14 +122,20 @@ export const LEAD_STATUSES = [
     "Lead Captured",
     "Discovery Call Scheduled",
     "Requirement Gathering",
-    "Pre-Assessment Form Sent",
-    "Proposal Preparation",
     "Proposal Sent",
     "Negotiation",
-    "Won",
-    "Lost"
 ] as const;
 
+export const LEAD_OUTCOMES = [
+    "open",
+    "won",
+    "lost",
+    "cancelled"
+]
+
+export type LeadStatus = typeof LEAD_STATUSES[number];
+export type LeadOutcome = typeof LEAD_OUTCOMES[number];
+export type LeadRegion = typeof LEAD_REGIONS[number];
 /** Preset industry labels for UI dropdowns; custom values still allowed via "Other". */
 export const LEAD_INDUSTRY_PRESETS = [
     "Technology",

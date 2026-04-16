@@ -1,11 +1,40 @@
 import type { Response } from "express";
 import { rtdb } from "../config/firebase.js";
 import type { AuthRequest } from "../middleware/authMiddleware.js";
-import type { ILead } from "../models/leadModel.js";
+import type { ILead, LeadOutcome, LeadStatus } from "../models/leadModel.js";
 
 const USERS_PATH = "users";
 const LEADS_PATH = "leads";
 const PROPOSALS_PATH = "proposals";
+const CLOSED_STATUSES = new Set(["Won", "Lost"]);
+const OPEN_PIPELINE_STATUSES = new Set([
+    "Lead Captured",
+    "Discovery Call Scheduled",
+    "Requirement Gathering",
+    "Pre-Assessment Form Sent",
+    "Proposal Preparation",
+    "Proposal Sent",
+    "Negotiation",
+]);
+
+const getLeadOutcome = (lead: Partial<ILead>): LeadOutcome => {
+    if (lead.outcome === "won" || lead.outcome === "lost" || lead.outcome === "cancelled") {
+        return lead.outcome;
+    }
+    const status = String(lead.status ?? "");
+    if (status === "Won") return "won";
+    if (status === "Lost") return "lost";
+    return "open";
+};
+
+const getLeadStage = (lead: Partial<ILead>): LeadStatus => {
+    if (lead.status && !CLOSED_STATUSES.has(lead.status)) {
+        return lead.status;
+    }
+    if (lead.lostAtStatus) return lead.lostAtStatus;
+    if (lead.wonAtStatus) return lead.wonAtStatus;
+    return "Lead Captured";
+};
 
 // Helper for manual "population"
 const populateRef = async (path: string, id: string, fields: string[]) => {
@@ -193,11 +222,11 @@ export const assignLead = async (req: AuthRequest, res: Response) => {
 
 export const updateLeadStatus = async (req: AuthRequest, res: Response) => {
     try {
-        const { status } = req.body;
+        const { status, outcome, lostReason, wonReason, latestRemark } = req.body;
         const id = req.params.id as string;
 
-        if (!status) {
-            res.status(400).json({ success: false, message: "Please provide a status" });
+        if (!status && !outcome) {
+            res.status(400).json({ success: false, message: "Please provide a status or outcome" });
             return;
         }
 
@@ -210,25 +239,100 @@ export const updateLeadStatus = async (req: AuthRequest, res: Response) => {
         }
 
         const leadData = snapshot.val() as ILead;
-        const oldStatus = leadData.status;
+        const oldStatus = getLeadStage(leadData);
+        const oldOutcome = getLeadOutcome(leadData);
         const timeline = [...(leadData?.timeline || [])];
+        const now = Date.now();
+        const requestedStatus = typeof status === "string" ? status.trim() : "";
+        const requestedOutcome = typeof outcome === "string" ? outcome.trim().toLowerCase() : "";
+        const updates: Partial<ILead> & { updatedAt: number } = { updatedAt: now };
+        let nextStatus = oldStatus;
+        let nextOutcome = oldOutcome;
 
-        if (oldStatus !== status) {
-            timeline.push({
-                event: "Status Changed",
-                performedBy: req.user!.id,
-                remark: `Lead moved from [${oldStatus}] to [${status}] via Admin Kanban`,
-                timestamp: Date.now()
-            });
-
-            await leadRef.update({ 
-                status, 
-                timeline, 
-                updatedAt: Date.now() 
-            });
+        if (requestedStatus) {
+            if (requestedStatus === "Won") {
+                nextOutcome = "won";
+            } else if (requestedStatus === "Lost") {
+                nextOutcome = "lost";
+            } else if (OPEN_PIPELINE_STATUSES.has(requestedStatus)) {
+                nextStatus = requestedStatus as LeadStatus;
+            } else {
+                res.status(400).json({ success: false, message: "Invalid status" });
+                return;
+            }
         }
 
-        res.status(200).json({ success: true, message: `Status updated to ${status}` });
+        if (requestedOutcome) {
+            if (!["open", "won", "lost", "cancelled"].includes(requestedOutcome)) {
+                res.status(400).json({ success: false, message: "Invalid outcome" });
+                return;
+            }
+            nextOutcome = requestedOutcome as LeadOutcome;
+        }
+
+        if (nextOutcome === "lost" && !String(lostReason ?? "").trim() && req.user.role === "sales_rep") {
+            res.status(400).json({ success: false, message: "Loss note is required when marking lead as lost" });
+            return;
+        }
+
+        if (nextOutcome === "won" || nextOutcome === "lost") {
+            timeline.push({
+                event: nextOutcome === "won" ? "Won" : "Lost",
+                status: nextStatus,
+                previousStatus: oldStatus,
+                outcome: nextOutcome,
+                reason: nextOutcome === "won" ? wonReason : lostReason,
+                performedBy: req.user!.id,
+                remark: String(latestRemark ?? "").trim() || `Lead marked ${nextOutcome} at [${nextStatus}] via Admin Kanban`,
+                timestamp: now
+            });
+            updates.status = nextStatus;
+            updates.outcome = nextOutcome;
+            updates.closedAt = now;
+            if (nextOutcome === "won") {
+                updates.wonAtStatus = nextStatus;
+                updates.lostAtStatus = null as any;
+                updates.wasEverWon = true;
+                const normalizedWonReason = String(wonReason ?? "").trim();
+                if (normalizedWonReason) {
+                    updates.wonReason = normalizedWonReason;
+                }
+            } else {
+                updates.lostAtStatus = nextStatus;
+                updates.wonAtStatus = null as any;
+                const normalizedLostReason = String(lostReason ?? "").trim();
+                if (normalizedLostReason) {
+                    updates.lostReason = normalizedLostReason;
+                }
+            }
+        } else if (nextStatus !== oldStatus || oldOutcome !== "open") {
+            timeline.push({
+                event: oldOutcome !== "open" ? "Reopened" : "Status Changed",
+                status: nextStatus,
+                previousStatus: oldStatus,
+                outcome: "open",
+                performedBy: req.user!.id,
+                remark: String(latestRemark ?? "").trim() || (
+                    oldOutcome !== "open"
+                        ? `Lead reopened and moved to [${nextStatus}] via Admin Kanban`
+                        : `Lead moved from [${oldStatus}] to [${nextStatus}] via Admin Kanban`
+                ),
+                timestamp: now
+            });
+            updates.status = nextStatus;
+            updates.outcome = "open";
+            updates.closedAt = null as any;
+            updates.wonAtStatus = null as any;
+            updates.lostAtStatus = null as any;
+        }
+
+        if (String(latestRemark ?? "").trim()) {
+            updates.latestRemark = String(latestRemark).trim();
+        }
+        updates.timeline = timeline;
+        await leadRef.update(updates);
+
+        res.status(200).json({ success: true, message: `Lead updated to ${nextOutcome === "open" ? nextStatus : nextOutcome}` });
     } catch (error: any) {
         res.status(500).json({ success: false, message: error.message });
     }
@@ -256,7 +360,12 @@ export const getLeadStats = async (req: AuthRequest, res: Response) => {
 
         const leads = snapshot.val();
         Object.values(leads).forEach((lead: any) => {
-            const status = lead.status;
+            const outcome = getLeadOutcome(lead);
+            const status = outcome === "won"
+                ? "Won"
+                : outcome === "lost"
+                    ? "Lost"
+                    : getLeadStage(lead);
             const count = stats[status];
             if (status && count !== undefined) {
                 stats[status] = count + 1;
