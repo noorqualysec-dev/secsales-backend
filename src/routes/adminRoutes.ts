@@ -15,7 +15,7 @@ import {
 const router = express.Router();
 
 // All routes in this file require: valid JWT token + admin role
-router.use(protect, authorize("admin"));
+router.use(protect, authorize("admin" , "manager"));
 
 // ── User management ──────────────────────────────────────────────────────────
 router.get("/users", getAllUsers);

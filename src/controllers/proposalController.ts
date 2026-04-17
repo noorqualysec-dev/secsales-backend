@@ -3,6 +3,7 @@ import { rtdb } from "../config/firebase.js";
 import type { AuthRequest } from "../middleware/authMiddleware.js";
 import type { IProposal } from "../models/proposalModel.js";
 import type { ILead, LeadOutcome, LeadStatus } from "../models/leadModel.js";
+import { canAccessAllProposals } from "../utils/roles.js";
 
 const PROPOSALS_PATH = "proposals";
 const LEADS_PATH = "leads";
@@ -35,7 +36,7 @@ export const getProposals = async (req: AuthRequest, res: Response) => {
     let ref = rtdb.ref(PROPOSALS_PATH);
     let snapshot;
 
-    if (req.user.role !== "admin") {
+    if (!canAccessAllProposals(req.user?.role)) {
       snapshot = await ref.orderByChild("createdBy").equalTo(req.user.id).once("value");
     } else {
       snapshot = await ref.orderByChild("createdAt").once("value");
@@ -79,7 +80,7 @@ export const createProposal = async (req: AuthRequest, res: Response) => {
     }
 
     const leadData = leadSnapshot.val();
-    if (leadData?.assignedTo !== req.user.id && req.user.role !== "admin") {
+    if (leadData?.assignedTo !== req.user.id && !canAccessAllProposals(req.user?.role)) {
       res.status(403).json({ success: false, message: "Not authorized to create a proposal for this lead" });
       return;
     }
@@ -170,7 +171,7 @@ export const getProposal = async (req: AuthRequest, res: Response) => {
 
     const proposal = snapshot.val() as IProposal;
 
-    if (proposal.createdBy !== req.user.id && req.user.role !== "admin") {
+    if (proposal.createdBy !== req.user.id && !canAccessAllProposals(req.user?.role)) {
       res.status(403).json({ success: false, message: "Not authorized to access this proposal" });
       return;
     }
@@ -202,7 +203,7 @@ export const updateProposal = async (req: AuthRequest, res: Response) => {
 
     const proposal = snapshot.val() as IProposal;
 
-    if (proposal.createdBy !== req.user.id && req.user.role !== "admin") {
+    if (proposal.createdBy !== req.user.id && !canAccessAllProposals(req.user?.role)) {
       res.status(403).json({ success: false, message: "Not authorized to update this proposal" });
       return;
     }
@@ -291,7 +292,7 @@ export const deleteProposal = async (req: AuthRequest, res: Response) => {
     }
 
     const proposal = snapshot.val() as IProposal;
-    if (proposal.createdBy !== req.user.id && req.user.role !== "admin") {
+    if (proposal.createdBy !== req.user.id && !canAccessAllProposals(req.user?.role)) {
       res.status(403).json({ success: false, message: "Not authorized to delete this proposal" });
       return;
     }

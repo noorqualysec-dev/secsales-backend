@@ -3,6 +3,7 @@ import { rtdb } from "../config/firebase.js";
 import type { AuthRequest } from "../middleware/authMiddleware.js";
 import { LEAD_REGIONS } from "../models/leadModel.js";
 import type { ILead, LeadContact, LeadOutcome, LeadStatus, LeadRegion } from "../models/leadModel.js";
+import { canAccessAllLeads } from "../utils/roles.js";
 import { v4 as uuidv4 } from "uuid";
 
 const LEADS_PATH = "leads";
@@ -272,7 +273,7 @@ export const getLeads = async (req: AuthRequest, res: Response) => {
     let ref = rtdb.ref(LEADS_PATH);
     let snapshot;
 
-    if (req.user.role !== "admin") {
+    if (!canAccessAllLeads(req.user?.role)) {
       snapshot = await ref.orderByChild("assignedTo").equalTo(req.user.id).once("value");
     } else {
       snapshot = await ref.orderByChild("createdAt").once("value");
@@ -305,7 +306,7 @@ export const getLeads = async (req: AuthRequest, res: Response) => {
 
 export const getCompanies = async (req: AuthRequest, res: Response) => {
   try {
-    const snapshot = req.user.role !== "admin"
+    const snapshot = !canAccessAllLeads(req.user?.role)
       ? await rtdb.ref(LEADS_PATH).orderByChild("assignedTo").equalTo(req.user.id).once("value")
       : await rtdb.ref(LEADS_PATH).orderByChild("createdAt").once("value");
 
@@ -383,7 +384,7 @@ export const getCompanyDetails = async (req: AuthRequest, res: Response) => {
       return;
     }
 
-    const snapshot = req.user.role !== "admin"
+    const snapshot = !canAccessAllLeads(req.user?.role)
       ? await rtdb.ref(LEADS_PATH).orderByChild("assignedTo").equalTo(req.user.id).once("value")
       : await rtdb.ref(LEADS_PATH).orderByChild("createdAt").once("value");
 
@@ -553,7 +554,7 @@ export const createLead = async (req: AuthRequest, res: Response) => {
     if (normalizedCompanyInsights !== undefined) leadData.companyInsights = normalizedCompanyInsights;
 
     leadData.createdBy = req.user.id;
-    if (req.user.role !== "admin" || !leadData.assignedTo) {
+    if (!canAccessAllLeads(req.user?.role) || !leadData.assignedTo) {
       leadData.assignedTo = req.user.id;
     }
 
@@ -673,7 +674,7 @@ export const getLead = async (req: AuthRequest, res: Response) => {
 
     const lead = snapshot.val() as ILead;
 
-    if (lead.assignedTo !== req.user.id && req.user.role !== "admin") {
+    if (lead.assignedTo !== req.user.id && !canAccessAllLeads(req.user?.role)) {
       res.status(403).json({ success: false, message: "Not authorized to access this lead" });
       return;
     }
@@ -788,7 +789,7 @@ export const updateLead = async (req: AuthRequest, res: Response) => {
 
     const lead = snapshot.val() as ILead;
 
-    if (lead.assignedTo !== req.user.id && req.user.role !== "admin") {
+    if (lead.assignedTo !== req.user.id && !canAccessAllLeads(req.user?.role)) {
       res.status(403).json({ success: false, message: "Not authorized to update this lead" });
       return;
     }
@@ -991,7 +992,7 @@ export const deleteLead = async (req: AuthRequest, res: Response) => {
     }
 
     const lead = snapshot.val() as ILead;
-    if (lead.assignedTo !== req.user.id && req.user.role !== "admin") {
+    if (lead.assignedTo !== req.user.id && !canAccessAllLeads(req.user?.role)) {
       res.status(403).json({ success: false, message: "Not authorized to delete this lead" });
       return;
     }
@@ -1017,7 +1018,7 @@ export const getLeadJourney = async (req: AuthRequest, res: Response) => {
         const leadData = leadSnapshot.val();
 
         // 2. Authorization Check
-        if (req.user.role !== "admin" && leadData.assignedTo !== req.user.id) {
+        if (!canAccessAllLeads(req.user?.role) && leadData.assignedTo !== req.user.id) {
             res.status(403).json({ success: false, message: "Not authorized to access this lead journey" });
             return;
         }
