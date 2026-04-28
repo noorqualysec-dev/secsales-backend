@@ -267,33 +267,67 @@ const populateUser = async (userId: string) => {
     return { _id: snapshot.key, name: data?.name, email: data?.email };
 };
 
+const getUserIdentityCandidates = (user: any): string[] => {
+  const ids = [user?.id, user?._id, user?.uid, user?.legacyUid]
+    .map((value) => String(value ?? "").trim())
+    .filter((value) => value.length > 0);
+  return Array.from(new Set(ids));
+};
+
+const canUserAccessLead = (lead: Partial<ILead>, user: any): boolean => {
+  const userIds = new Set(getUserIdentityCandidates(user));
+  if (!userIds.size) return false;
+
+  const assignedTo = String(lead.assignedTo ?? "").trim();
+  const createdBy = String(lead.createdBy ?? "").trim();
+
+  // Primary rule: when assignment exists, visibility is strictly by assignee.
+  if (assignedTo) return userIds.has(assignedTo);
+
+  // Legacy fallback: only use creator-based access if assignment is missing.
+  if (createdBy) return userIds.has(createdBy);
+  return false;
+};
+
+const getScopedLeadsMap = async (user: any, role: string | null | undefined): Promise<Record<string, ILead>> => {
+  const snapshot = await rtdb.ref(LEADS_PATH).orderByChild("createdAt").once("value");
+  if (!snapshot.exists()) return {};
+
+  const allLeads = snapshot.val() as Record<string, ILead>;
+  if (canAccessAllLeads(role)) return allLeads;
+
+  const scoped: Record<string, ILead> = {};
+  for (const [leadId, lead] of Object.entries(allLeads)) {
+    if (!lead) continue;
+    if (canUserAccessLead(lead, user)) {
+      scoped[leadId] = lead;
+    }
+  }
+  return scoped;
+};
+
 // @desc    Get all leads
 export const getLeads = async (req: AuthRequest, res: Response) => {
   try {
-    let ref = rtdb.ref(LEADS_PATH);
-    let snapshot;
+    const leadsData = await getScopedLeadsMap(req.user, req.user?.role);
 
-    if (!canAccessAllLeads(req.user?.role)) {
-      snapshot = await ref.orderByChild("assignedTo").equalTo(req.user.id).once("value");
-    } else {
-      snapshot = await ref.orderByChild("createdAt").once("value");
-    }
-
-    if (!snapshot.exists()) {
+    if (!Object.keys(leadsData).length) {
         res.status(200).json({ success: true, count: 0, data: [] });
         return;
     }
 
-    const leadsData = snapshot.val();
-    const leads = await Promise.all(Object.keys(leadsData).map(async (key) => {
-        const data = leadsData[key];
-        return { 
-            _id: key, 
-            ...data,
-            assignedTo: await populateUser(data.assignedTo),
-            createdBy: await populateUser(data.createdBy)
+    const rawLeads = await Promise.all(
+      Object.entries(leadsData).map(async ([key, data]) => {
+        if (!data) return null;
+        return {
+          _id: key,
+          ...data,
+          assignedTo: await populateUser(data.assignedTo || ""),
+          createdBy: await populateUser(data.createdBy || ""),
         };
-    }));
+      })
+    );
+    const leads = rawLeads.filter((lead): lead is NonNullable<typeof lead> => Boolean(lead));
 
     // RTDB orderByChild is ascending by default, we want descending
     leads.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
@@ -306,17 +340,14 @@ export const getLeads = async (req: AuthRequest, res: Response) => {
 
 export const getCompanies = async (req: AuthRequest, res: Response) => {
   try {
-    const snapshot = !canAccessAllLeads(req.user?.role)
-      ? await rtdb.ref(LEADS_PATH).orderByChild("assignedTo").equalTo(req.user.id).once("value")
-      : await rtdb.ref(LEADS_PATH).orderByChild("createdAt").once("value");
+    const leadsData = await getScopedLeadsMap(req.user, req.user?.role);
 
-    if (!snapshot.exists()) {
+    if (!Object.keys(leadsData).length) {
       res.status(200).json({ success: true, count: 0, data: [] });
       return;
     }
 
     const companies = new Map<string, any>();
-    const leadsData = snapshot.val() as Record<string, ILead>;
 
     for (const [leadId, lead] of Object.entries(leadsData)) {
       const companyName = normalizeCompanyName(lead.company);
@@ -384,16 +415,13 @@ export const getCompanyDetails = async (req: AuthRequest, res: Response) => {
       return;
     }
 
-    const snapshot = !canAccessAllLeads(req.user?.role)
-      ? await rtdb.ref(LEADS_PATH).orderByChild("assignedTo").equalTo(req.user.id).once("value")
-      : await rtdb.ref(LEADS_PATH).orderByChild("createdAt").once("value");
+    const leadsData = await getScopedLeadsMap(req.user, req.user?.role);
 
-    if (!snapshot.exists()) {
+    if (!Object.keys(leadsData).length) {
       res.status(404).json({ success: false, message: "Company not found" });
       return;
     }
 
-    const leadsData = snapshot.val() as Record<string, ILead>;
     const matching = Object.entries(leadsData).filter(([, lead]) => companyToKey(normalizeCompanyName(lead.company)) === companyKey);
 
     if (!matching.length) {
@@ -592,6 +620,116 @@ export const createLead = async (req: AuthRequest, res: Response) => {
 
 const VALID_STATUSES = ["Lead Captured","Discovery Call Scheduled","Requirement Gathering","Pre-Assessment Form Sent","Proposal Preparation","Proposal Sent","Negotiation","Won","Lost"];
 const VALID_SOURCES  = ["website","email_marketing","linkedin","referral","events","recurring","partnership","offline_source","other"];
+const OWNER_EMAIL_FIELDS = ["Owner Email", "Owner E-mail", "OwnerEmail", "ownerEmail", "owner_email", "owner_email_address"];
+const OWNER_NAME_FIELDS = ["Owner", "Owner Name", "Lead Owner", "Assigned To", "Assignee", "owner", "ownerName"];
+const IMPORT_ASSIGNABLE_ROLES = new Set(["sales_rep", "manager"]);
+
+type ImportAssignableUser = {
+  id: string;
+  name: string;
+  email: string;
+};
+
+function normalizeImportEmail(value: unknown): string {
+  return String(value ?? "").trim().toLowerCase();
+}
+
+function normalizeImportName(value: unknown): string {
+  return String(value ?? "").trim().toLowerCase().replace(/\s+/g, " ");
+}
+
+function getFirstImportField(row: Record<string, unknown>, fields: string[]): string {
+  for (const field of fields) {
+    const value = row[field];
+    if (value === null || value === undefined) continue;
+    const text = String(value).trim();
+    if (text) return text;
+  }
+  return "";
+}
+
+function isLikelyNameMatch(inputName: string, userName: string): boolean {
+  if (!inputName || !userName) return false;
+  if (inputName === userName) return true;
+  if (userName.includes(inputName) || inputName.includes(userName)) return true;
+
+  const inputTokens = inputName.split(" ").filter(Boolean);
+  const userTokens = userName.split(" ").filter(Boolean);
+  if (!inputTokens.length || !userTokens.length) return false;
+  return inputTokens.some((token) => userTokens.some((u) => u.startsWith(token) || token.startsWith(u)));
+}
+
+async function getImportAssignableUsers() {
+  const byEmail = new Map<string, ImportAssignableUser>();
+  const byName = new Map<string, ImportAssignableUser[]>();
+  const snapshot = await rtdb.ref(USERS_PATH).once("value");
+
+  if (!snapshot.exists()) {
+    return { byEmail, byName };
+  }
+
+  const users = snapshot.val() as Record<string, { name?: unknown; email?: unknown; role?: unknown; isActive?: unknown }>;
+  for (const [id, user] of Object.entries(users)) {
+    if (!user || user.isActive === false) continue;
+
+    const role = String(user.role ?? "").trim().toLowerCase();
+    if (role && !IMPORT_ASSIGNABLE_ROLES.has(role)) continue;
+
+    const email = normalizeImportEmail(user.email);
+    const name = String(user.name ?? "").trim();
+    const normalizedName = normalizeImportName(name);
+    if (!email && !normalizedName) continue;
+
+    const mappedUser: ImportAssignableUser = { id, name, email };
+    if (email && !byEmail.has(email)) {
+      byEmail.set(email, mappedUser);
+    }
+
+    if (normalizedName) {
+      const existing = byName.get(normalizedName) || [];
+      existing.push(mappedUser);
+      byName.set(normalizedName, existing);
+    }
+  }
+
+  return { byEmail, byName };
+}
+
+function resolveImportAssigneeId(
+  row: Record<string, unknown>,
+  usersLookup: { byEmail: Map<string, ImportAssignableUser>; byName: Map<string, ImportAssignableUser[]> },
+  fallbackUserId: string
+): string | null {
+  const ownerEmail = normalizeImportEmail(getFirstImportField(row, OWNER_EMAIL_FIELDS));
+  const ownerNameRaw = getFirstImportField(row, OWNER_NAME_FIELDS);
+  const ownerName = normalizeImportName(ownerNameRaw);
+
+  if (ownerEmail) {
+    const byEmail = usersLookup.byEmail.get(ownerEmail);
+    if (!byEmail) return null;
+    if (ownerName && !isLikelyNameMatch(ownerName, normalizeImportName(byEmail.name))) return null;
+    return byEmail.id;
+  }
+
+  if (ownerName) {
+    const exactMatches = usersLookup.byName.get(ownerName) || [];
+    if (exactMatches.length === 1) return exactMatches[0]?.id || null;
+    if (exactMatches.length > 1) return null;
+
+    const fuzzyMatches: ImportAssignableUser[] = [];
+    for (const users of usersLookup.byName.values()) {
+      for (const user of users) {
+        if (isLikelyNameMatch(ownerName, normalizeImportName(user.name))) {
+          fuzzyMatches.push(user);
+        }
+      }
+    }
+    if (fuzzyMatches.length === 1) return fuzzyMatches[0]?.id || null;
+    if (fuzzyMatches.length > 1) return null;
+  }
+
+  return fallbackUserId;
+}
 
 // @desc    Bulk import leads from CSV
 export const bulkImportLeads = async (req: AuthRequest, res: Response) => {
@@ -610,35 +748,43 @@ export const bulkImportLeads = async (req: AuthRequest, res: Response) => {
         if (l.email) existingEmails.add(l.email.toLowerCase().trim());
       });
     }
+    const assignableUsers = await getImportAssignableUsers();
 
     let imported = 0;
     let skipped = 0;
 
-    for (const row of rows) {
-      if (!row.firstName || !row.email) { skipped++; continue; }
-      if (existingEmails.has(row.email.toLowerCase().trim())) { skipped++; continue; }
+    for (const rawRow of rows) {
+      const row = rawRow as Record<string, unknown>;
+      const email = normalizeImportEmail(row.email ?? row.Email);
+      const firstName = String(row.firstName ?? row["First Name"] ?? "").trim();
+
+      if (!firstName || !email) { skipped++; continue; }
+      if (existingEmails.has(email)) { skipped++; continue; }
+
+      const assigneeId = resolveImportAssigneeId(row, assignableUsers, req.user.id);
+      if (!assigneeId) { skipped++; continue; }
 
       const ref = rtdb.ref(LEADS_PATH).push();
       await ref.set({
-        firstName:        row.firstName || "",
-        lastName:         row.lastName  || "",
-        email:            row.email,
-        phone:            row.phone     || "",
-        designation:      row.designation || "",
-        company:          row.company   || "",
-        industry:         row.industry  || "",
-        country:          row.country   || "",
-        region:           VALID_REGIONS.has(String(row.region ?? "").trim()) ? String(row.region).trim() : undefined,
-        employeeStrength: row.employeeStrength || "",
-        status:           LEGACY_OPEN_STATUSES.has(row.status) ? row.status : "Lead Captured",
-        outcome:          row.status === "Won" ? "won" : row.status === "Lost" ? "lost" : "open",
-        wonAtStatus:      row.status === "Won" ? "Negotiation" : undefined,
-        lostAtStatus:     row.status === "Lost" ? "Negotiation" : undefined,
-        source:           VALID_SOURCES.includes(row.source)  ? row.source  : "other",
-        dealValue:        Number(row.dealValue) || 0,
-        closingDate:      Number(row.closingDate) || 0,
-        latestRemark:     row.latestRemark || "",
-        assignedTo:       req.user.id,
+        firstName:        String(row.firstName ?? row["First Name"] ?? ""),
+        lastName:         String(row.lastName ?? row["Last Name"] ?? ""),
+        email,
+        phone:            String(row.phone ?? row.Phone ?? ""),
+        designation:      String(row.designation ?? row.Position ?? ""),
+        company:          String(row.company ?? row.Company ?? ""),
+        industry:         String(row.industry ?? row["Industry Vertical"] ?? row["Industrial Vertical"] ?? ""),
+        country:          String(row.country ?? row.Country ?? ""),
+        region:           VALID_REGIONS.has(String(row.region ?? row.Region ?? "").trim()) ? String(row.region ?? row.Region).trim() : undefined,
+        employeeStrength: String(row.employeeStrength ?? row["Employee Count"] ?? row["Employee Strength"] ?? ""),
+        status:           LEGACY_OPEN_STATUSES.has(String(row.status ?? row.Status ?? "").trim()) ? String(row.status ?? row.Status).trim() : "Lead Captured",
+        outcome:          String(row.status ?? row.Status ?? "").trim() === "Won" ? "won" : String(row.status ?? row.Status ?? "").trim() === "Lost" ? "lost" : "open",
+        wonAtStatus:      String(row.status ?? row.Status ?? "").trim() === "Won" ? "Negotiation" : undefined,
+        lostAtStatus:     String(row.status ?? row.Status ?? "").trim() === "Lost" ? "Negotiation" : undefined,
+        source:           VALID_SOURCES.includes(String(row.source ?? row["Lead Source"] ?? "").trim()) ? String(row.source ?? row["Lead Source"]).trim() : "other",
+        dealValue:        Number(row.dealValue ?? row["Deal Value"]) || 0,
+        closingDate:      Number(row.closingDate ?? row["Close Date"] ?? row["Closing Date"]) || 0,
+        latestRemark:     String(row.latestRemark ?? row.Notes ?? ""),
+        assignedTo:       assigneeId,
         createdBy:        req.user.id,
         timeline: [{
           event: "Creation",
@@ -651,7 +797,7 @@ export const bulkImportLeads = async (req: AuthRequest, res: Response) => {
         updatedAt: Date.now()
       });
 
-      existingEmails.add(row.email.toLowerCase().trim());
+      existingEmails.add(email);
       imported++;
     }
 
@@ -674,7 +820,7 @@ export const getLead = async (req: AuthRequest, res: Response) => {
 
     const lead = snapshot.val() as ILead;
 
-    if (lead.assignedTo !== req.user.id && !canAccessAllLeads(req.user?.role)) {
+    if (!canAccessAllLeads(req.user?.role) && !canUserAccessLead(lead, req.user)) {
       res.status(403).json({ success: false, message: "Not authorized to access this lead" });
       return;
     }
@@ -789,7 +935,7 @@ export const updateLead = async (req: AuthRequest, res: Response) => {
 
     const lead = snapshot.val() as ILead;
 
-    if (lead.assignedTo !== req.user.id && !canAccessAllLeads(req.user?.role)) {
+    if (!canAccessAllLeads(req.user?.role) && !canUserAccessLead(lead, req.user)) {
       res.status(403).json({ success: false, message: "Not authorized to update this lead" });
       return;
     }
@@ -992,7 +1138,7 @@ export const deleteLead = async (req: AuthRequest, res: Response) => {
     }
 
     const lead = snapshot.val() as ILead;
-    if (lead.assignedTo !== req.user.id && !canAccessAllLeads(req.user?.role)) {
+    if (!canAccessAllLeads(req.user?.role) && !canUserAccessLead(lead, req.user)) {
       res.status(403).json({ success: false, message: "Not authorized to delete this lead" });
       return;
     }
@@ -1018,7 +1164,7 @@ export const getLeadJourney = async (req: AuthRequest, res: Response) => {
         const leadData = leadSnapshot.val();
 
         // 2. Authorization Check
-        if (!canAccessAllLeads(req.user?.role) && leadData.assignedTo !== req.user.id) {
+        if (!canAccessAllLeads(req.user?.role) && !canUserAccessLead(leadData as ILead, req.user)) {
             res.status(403).json({ success: false, message: "Not authorized to access this lead journey" });
             return;
         }

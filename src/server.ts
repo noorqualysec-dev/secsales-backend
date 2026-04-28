@@ -62,6 +62,7 @@ import integrationRoutes from "./routes/integrationRoutes.js";
 import cronRoutes from "./routes/cronRoutes.js";
 import notificationRoutes from "./routes/notificationRoutes.js";
 import { startLeadFollowUpCron } from "./jobs/leadFollowUpCron.js";
+import leadImportRoutes from "./routes/leadImportRoutes.js";
 
 // Firebase initialization
 import "./config/firebase.js";
@@ -202,6 +203,7 @@ app.use("/api/auth", authRoutes);
 app.use("/api/integrations", integrationRoutes);
 app.use("/api/cron", cronRoutes);
 app.use("/api/notifications", notificationRoutes);
+app.use("/api/lead-import", leadImportRoutes);
 
 // ❗ IMPORTANT: NO app.listen here
 

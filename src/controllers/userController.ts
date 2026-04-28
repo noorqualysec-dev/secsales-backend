@@ -15,6 +15,11 @@ export const createUser = async (req: Request, res: Response) => {
             return;
         }
 
+        if (role === "manager") {
+            res.status(403).json({ success: false, message: "Manager accounts can only be assigned by admin" });
+            return;
+        }
+
         // 1. Check if user already exists
         const snapshot = await rtdb.ref(USERS_PATH).orderByChild("email").equalTo(email).once("value");
 
@@ -147,7 +152,10 @@ export const updateUser = async (req: Request, res: Response) => {
 
         if (name) updateData.name = name;
         if (email) updateData.email = email;
-        if (role) updateData.role = role;
+        if (role) {
+            res.status(403).json({ success: false, message: "Role updates are only allowed from admin user management" });
+            return;
+        }
         if (password) {
             const salt = await bcrypt.genSalt(10);
             updateData.password = await bcrypt.hash(password, salt);

@@ -1,0 +1,38 @@
+export interface ExcelLeadRow {
+  Date?: string | Date;
+  "First Name"?: string;
+  "Last Name"?: string;
+  Owner?: string;
+  "Owner Email"?: string;
+  "Owner E-mail"?: string;
+  OwnerEmail?: string;
+  "Deal Name"?: string;
+  Company?: string;
+  Country?: string;
+  "Industrial Vertical"?: string;
+  "Industry Vertical"?: string;
+  Industry?: string;
+  "Employee Count"?: string | number;
+  "Employee Strength"?: string | number;
+  "Contact Person"?: string;
+  Position?: string;
+  Email?: string;
+  Phone?: string;
+  "Deal Value"?: string | number;
+  "Win Probability"?: string | number;
+  Stage?: string;
+  Status?: string;
+  Source?: string;
+  Outcome?: string;
+  "Lead Source"?: string;
+  "Close Date"?: string | Date;
+  "Closing Date"?: string | Date;
+  "Followup Date"?: string | Date;
+  "Follow Up Date"?: string | Date;
+  Notes?: string;
+  Remarks?: string;
+  Notes2?: string;
+  "Note 2"?: string;
+  Notes3?: string;
+  "Note 3"?: string;
+}

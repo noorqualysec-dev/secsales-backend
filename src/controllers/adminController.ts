@@ -91,6 +91,14 @@ export const updateUserRole = async (req: AuthRequest, res: Response) => {
             return;
         }
 
+        if (role === "manager" && req.user?.role !== "admin") {
+            res.status(403).json({
+                success: false,
+                message: "Only admin can assign manager role",
+            });
+            return;
+        }
+
         const userRef = rtdb.ref(`${USERS_PATH}/${id}`);
         const snapshot = await userRef.once("value");
 

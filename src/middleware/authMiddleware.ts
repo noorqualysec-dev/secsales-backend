@@ -44,8 +44,14 @@ export const protect = async (req: AuthRequest, res: Response, next: NextFunctio
             const userData = snapshot.val();
             if (userData) {
                 delete userData.password;
-                // Standardize: use both id and _id to be safe
-                req.user = { id: snapshot.key, _id: snapshot.key, ...userData };
+                // Standardize identity keys to RTDB key; keep legacy uid (if present) for backward compatibility.
+                req.user = {
+                    ...userData,
+                    legacyUid: userData?.uid,
+                    id: snapshot.key,
+                    _id: snapshot.key,
+                    uid: snapshot.key,
+                };
             }
 
             next();

@@ -1,8 +1,11 @@
+export const isAdminRole = (role: string | null | undefined) =>
+  role === "admin";
+
 export const isElevatedRole = (role: string | null | undefined) =>
-  role === "admin" || role === "manager";
+  isAdminRole(role) || role === "manager";
 
 export const canAccessAllLeads = (role: string | null | undefined) =>
-  isElevatedRole(role);
+  isAdminRole(role);
 
 export const canAccessAllProposals = (role: string | null | undefined) =>
-  isElevatedRole(role);
+  isAdminRole(role);
