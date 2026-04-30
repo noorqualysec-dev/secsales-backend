@@ -9,6 +9,8 @@ const PROPOSALS_PATH = "proposals";
 const LEADS_PATH = "leads";
 const USERS_PATH = "users";
 const CLOSED_STATUSES = new Set(["Won", "Lost"]);
+const normalizeTestingScope = (value: unknown): string[] =>
+  Array.isArray(value) ? value.filter((scope): scope is string => typeof scope === "string") : [];
 
 const getLeadStage = (lead: Partial<ILead>): LeadStatus => {
     if (lead.status && !CLOSED_STATUSES.has(lead.status)) {
@@ -53,6 +55,7 @@ export const getProposals = async (req: AuthRequest, res: Response) => {
         return {
             _id: key,
             ...data,
+            testingScope: normalizeTestingScope(data.testingScope),
             lead: await populateRef(LEADS_PATH, data.lead, ["firstName", "lastName", "company"]),
             createdBy: await populateRef(USERS_PATH, data.createdBy, ["name", "email"])
         };
@@ -70,6 +73,7 @@ export const getProposals = async (req: AuthRequest, res: Response) => {
 export const createProposal = async (req: AuthRequest, res: Response) => {
   try {
     const { lead: leadId, value, testingScope, status, notes } = req.body;
+    const normalizedTestingScope = normalizeTestingScope(testingScope);
 
     const leadRef = rtdb.ref(`${LEADS_PATH}/${leadId}`);
     const leadSnapshot = await leadRef.once("value");
@@ -88,7 +92,7 @@ export const createProposal = async (req: AuthRequest, res: Response) => {
     const proposalData: IProposal = {
       lead: leadId,
       value,
-      testingScope,
+      testingScope: normalizedTestingScope,
       status: status || "Draft",
       notes,
       createdBy: req.user.id,
@@ -179,6 +183,7 @@ export const getProposal = async (req: AuthRequest, res: Response) => {
     const populated = {
         _id: snapshot.key,
         ...proposal,
+        testingScope: normalizeTestingScope(proposal.testingScope),
         lead: await populateRef(LEADS_PATH, proposal.lead, ["firstName", "lastName", "company"]),
         createdBy: await populateRef(USERS_PATH, proposal.createdBy, ["name", "email"])
     };
@@ -211,6 +216,9 @@ export const updateProposal = async (req: AuthRequest, res: Response) => {
     const updates = { ...req.body, updatedAt: Date.now() };
     delete updates.createdBy;
     delete updates.lead;
+    if (Object.prototype.hasOwnProperty.call(updates, "testingScope")) {
+      updates.testingScope = normalizeTestingScope(updates.testingScope);
+    }
 
     await propRef.update(updates);
 

@@ -3,6 +3,7 @@ import { rtdb } from "../config/firebase.js";
 import type { AuthRequest } from "../middleware/authMiddleware.js";
 import { LEAD_STATUSES, normalizeLeadStatus } from "../models/leadModel.js";
 import type { ILead, LeadOutcome, LeadStatus } from "../models/leadModel.js";
+import { syncProposalsFromLeadTransition } from "../utils/proposalSync.js";
 
 const USERS_PATH = "users";
 const LEADS_PATH = "leads";
@@ -13,6 +14,8 @@ const OPEN_PIPELINE_STATUSES = new Set<string>([
     "Pre-Assessment Form Sent",
     "Proposal Preparation",
 ]);
+const normalizeTestingScope = (value: unknown): string[] =>
+    Array.isArray(value) ? value.filter((scope): scope is string => typeof scope === "string") : [];
 
 const getLeadOutcome = (lead: Partial<ILead>): LeadOutcome => {
     if (lead.outcome === "won" || lead.outcome === "lost" || lead.outcome === "cancelled") {
@@ -369,6 +372,24 @@ export const updateLeadStatus = async (req: AuthRequest, res: Response) => {
         updates.timeline = timeline;
         await leadRef.update(updates);
 
+        try {
+            const syncNote = String(latestRemark ?? "").trim();
+            await syncProposalsFromLeadTransition({
+                leadId: id,
+                previousLead: leadData,
+                nextLead: {
+                    ...leadData,
+                    ...updates,
+                    status: updates.status || nextStatus,
+                    outcome: updates.outcome || nextOutcome,
+                },
+                performedBy: req.user!.id,
+                ...(syncNote ? { note: syncNote } : {}),
+            });
+        } catch (proposalSyncError) {
+            console.error("[proposal-sync:updateLeadStatus]", proposalSyncError);
+        }
+
         res.status(200).json({ success: true, message: `Lead updated to ${nextOutcome === "open" ? nextStatus : nextOutcome}` });
     } catch (error: any) {
         res.status(500).json({ success: false, message: error.message });
@@ -467,6 +488,7 @@ export const getAllProposals = async (req: AuthRequest, res: Response) => {
             return {
                 _id: key,
                 ...data,
+                testingScope: normalizeTestingScope(data.testingScope),
                 lead: await populateRef(LEADS_PATH, data.lead, ["firstName", "lastName", "company", "status"]),
                 createdBy: await populateRef(USERS_PATH, data.createdBy, ["name", "email", "role"])
             };

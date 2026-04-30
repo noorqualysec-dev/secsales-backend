@@ -3,7 +3,8 @@ import { rtdb } from "../config/firebase.js";
 import type { AuthRequest } from "../middleware/authMiddleware.js";
 import { LEAD_REGIONS, LEAD_STATUSES, normalizeLeadStatus } from "../models/leadModel.js";
 import type { ILead, LeadContact, LeadOutcome, LeadStatus, LeadRegion } from "../models/leadModel.js";
-import { canAccessAllLeads } from "../utils/roles.js";
+import { canAccessAllLeads, isElevatedRole } from "../utils/roles.js";
+import { syncProposalsFromLeadTransition } from "../utils/proposalSync.js";
 import { v4 as uuidv4 } from "uuid";
 
 const LEADS_PATH = "leads";
@@ -300,7 +301,11 @@ const canUserAccessLead = (lead: Partial<ILead>, user: any): boolean => {
   return false;
 };
 
-const getScopedLeadsMap = async (user: any, role: string | null | undefined): Promise<Record<string, ILead>> => {
+const getScopedLeadsMap = async (
+  user: any,
+  role: string | null | undefined,
+  options: { forceAll?: boolean } = {}
+): Promise<Record<string, ILead>> => {
   const snapshot = await rtdb.ref(LEADS_PATH).orderByChild("createdAt").once("value");
   if (!snapshot.exists()) return {};
 
@@ -308,7 +313,7 @@ const getScopedLeadsMap = async (user: any, role: string | null | undefined): Pr
   const allLeads = Object.fromEntries(
     Object.entries(allLeadsRaw).map(([leadId, lead]) => [leadId, normalizeLeadStatusFields(lead)])
   ) as Record<string, ILead>;
-  if (canAccessAllLeads(role)) return allLeads;
+  if (options.forceAll || canAccessAllLeads(role)) return allLeads;
 
   const scoped: Record<string, ILead> = {};
   for (const [leadId, lead] of Object.entries(allLeads)) {
@@ -319,6 +324,14 @@ const getScopedLeadsMap = async (user: any, role: string | null | undefined): Pr
   }
   return scoped;
 };
+
+const isGlobalCompanyScopeRequested = (value: unknown): boolean => {
+  const scope = String(value ?? "").trim().toLowerCase();
+  return scope === "all" || scope === "global" || scope === "team";
+};
+
+const canUseGlobalCompanyScope = (req: AuthRequest): boolean =>
+  isGlobalCompanyScopeRequested(req.query.scope) && isElevatedRole(req.user?.role);
 
 // @desc    Get all leads
 export const getLeads = async (req: AuthRequest, res: Response) => {
@@ -354,7 +367,9 @@ export const getLeads = async (req: AuthRequest, res: Response) => {
 
 export const getCompanies = async (req: AuthRequest, res: Response) => {
   try {
-    const leadsData = await getScopedLeadsMap(req.user, req.user?.role);
+    const leadsData = await getScopedLeadsMap(req.user, req.user?.role, {
+      forceAll: canUseGlobalCompanyScope(req),
+    });
 
     if (!Object.keys(leadsData).length) {
       res.status(200).json({ success: true, count: 0, data: [] });
@@ -429,7 +444,9 @@ export const getCompanyDetails = async (req: AuthRequest, res: Response) => {
       return;
     }
 
-    const leadsData = await getScopedLeadsMap(req.user, req.user?.role);
+    const leadsData = await getScopedLeadsMap(req.user, req.user?.role, {
+      forceAll: canUseGlobalCompanyScope(req),
+    });
 
     if (!Object.keys(leadsData).length) {
       res.status(404).json({ success: false, message: "Company not found" });
@@ -622,6 +639,21 @@ export const createLead = async (req: AuthRequest, res: Response) => {
 
     const newLeadRef = rtdb.ref(LEADS_PATH).push();
     await newLeadRef.set(leadData);
+    const newLeadId = newLeadRef.key;
+
+    if (newLeadId) {
+      try {
+        await syncProposalsFromLeadTransition({
+          leadId: newLeadId,
+          previousLead: { status: "Lead Captured", outcome: "open" },
+          nextLead: leadData,
+          performedBy: req.user.id,
+          note: "Auto-generated from lead creation",
+        });
+      } catch (proposalSyncError) {
+        console.error("[proposal-sync:createLead]", proposalSyncError);
+      }
+    }
 
     res.status(201).json({
       success: true,
@@ -1145,6 +1177,23 @@ export const updateLead = async (req: AuthRequest, res: Response) => {
     delete updates.createdBy;
 
     await leadRef.update(updates);
+
+    try {
+      await syncProposalsFromLeadTransition({
+        leadId: id,
+        previousLead: lead,
+        nextLead: {
+          ...lead,
+          ...updates,
+          status: nextStage,
+          outcome: nextOutcome,
+        },
+        performedBy: req.user.id,
+      });
+    } catch (proposalSyncError) {
+      console.error("[proposal-sync:updateLead]", proposalSyncError);
+    }
+
     res.status(200).json({ success: true, message: "Lead updated successfully" });
   } catch (error: any) {
     res.status(400).json({ success: false, message: error.message });
