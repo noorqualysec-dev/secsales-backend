@@ -1,7 +1,7 @@
 import type { Response } from "express";
 import { rtdb } from "../config/firebase.js";
 import type { AuthRequest } from "../middleware/authMiddleware.js";
-import { LEAD_REGIONS } from "../models/leadModel.js";
+import { LEAD_REGIONS, LEAD_STATUSES, normalizeLeadStatus } from "../models/leadModel.js";
 import type { ILead, LeadContact, LeadOutcome, LeadStatus, LeadRegion } from "../models/leadModel.js";
 import { canAccessAllLeads } from "../utils/roles.js";
 import { v4 as uuidv4 } from "uuid";
@@ -14,14 +14,10 @@ const DIAL_CODE_RE = /^\+\d{1,4}$/;
 const NATIONAL_PHONE_RE = /^\d{4,15}$/;
 const COMPANY_KEY_RE = /[^a-z0-9]+/g;
 const CLOSED_OUTCOME_STATUSES = new Set(["Won", "Lost"]);
-const LEGACY_OPEN_STATUSES = new Set([
-    "Lead Captured",
-    "Discovery Call Scheduled",
-    "Requirement Gathering",
+const LEGACY_OPEN_STATUSES = new Set<string>([
+    ...LEAD_STATUSES,
     "Pre-Assessment Form Sent",
     "Proposal Preparation",
-    "Proposal Sent",
-    "Negotiation",
 ]);
 const VALID_OUTCOMES = new Set<LeadOutcome>(["open", "won", "lost", "cancelled"]);
 const VALID_REGIONS = new Set<string>(LEAD_REGIONS);
@@ -220,11 +216,26 @@ function getEffectiveLeadOutcome(lead: Partial<ILead>): LeadOutcome {
 
 function getLatestActiveStage(lead: Partial<ILead>): LeadStatus {
     if (lead.status && !CLOSED_OUTCOME_STATUSES.has(lead.status)) {
-        return lead.status;
+        return normalizeLeadStatus(lead.status);
     }
-    if (lead.lostAtStatus) return lead.lostAtStatus;
-    if (lead.wonAtStatus) return lead.wonAtStatus;
+    if (lead.lostAtStatus) return normalizeLeadStatus(lead.lostAtStatus);
+    if (lead.wonAtStatus) return normalizeLeadStatus(lead.wonAtStatus);
     return "Lead Captured";
+}
+
+function normalizeLeadStatusFields<T extends Partial<ILead>>(lead: T): T {
+    const normalized = { ...lead } as T & Record<string, unknown>;
+    const status = String(lead.status ?? "").trim();
+    if (status && !CLOSED_OUTCOME_STATUSES.has(status)) {
+        normalized.status = normalizeLeadStatus(status);
+    }
+    if (lead.lostAtStatus) {
+        normalized.lostAtStatus = normalizeLeadStatus(lead.lostAtStatus);
+    }
+    if (lead.wonAtStatus) {
+        normalized.wonAtStatus = normalizeLeadStatus(lead.wonAtStatus);
+    }
+    return normalized as T;
 }
 
 function buildPrimaryContactFromLead(leadId: string, lead: ILead) {
@@ -293,7 +304,10 @@ const getScopedLeadsMap = async (user: any, role: string | null | undefined): Pr
   const snapshot = await rtdb.ref(LEADS_PATH).orderByChild("createdAt").once("value");
   if (!snapshot.exists()) return {};
 
-  const allLeads = snapshot.val() as Record<string, ILead>;
+  const allLeadsRaw = snapshot.val() as Record<string, ILead>;
+  const allLeads = Object.fromEntries(
+    Object.entries(allLeadsRaw).map(([leadId, lead]) => [leadId, normalizeLeadStatusFields(lead)])
+  ) as Record<string, ILead>;
   if (canAccessAllLeads(role)) return allLeads;
 
   const scoped: Record<string, ILead> = {};
@@ -595,7 +609,7 @@ export const createLead = async (req: AuthRequest, res: Response) => {
       timestamp: now
     }];
 
-    leadData.status = leadData.status || "Lead Captured";
+    leadData.status = normalizeLeadStatus(leadData.status);
     leadData.outcome = "open";
     leadData.createdAt = now;
     leadData.updatedAt = now;
@@ -618,7 +632,6 @@ export const createLead = async (req: AuthRequest, res: Response) => {
   }
 };
 
-const VALID_STATUSES = ["Lead Captured","Discovery Call Scheduled","Requirement Gathering","Pre-Assessment Form Sent","Proposal Preparation","Proposal Sent","Negotiation","Won","Lost"];
 const VALID_SOURCES  = ["website","email_marketing","linkedin","referral","events","recurring","partnership","offline_source","other"];
 const OWNER_EMAIL_FIELDS = ["Owner Email", "Owner E-mail", "OwnerEmail", "ownerEmail", "owner_email", "owner_email_address"];
 const OWNER_NAME_FIELDS = ["Owner", "Owner Name", "Lead Owner", "Assigned To", "Assignee", "owner", "ownerName"];
@@ -765,6 +778,11 @@ export const bulkImportLeads = async (req: AuthRequest, res: Response) => {
       if (!assigneeId) { skipped++; continue; }
 
       const ref = rtdb.ref(LEADS_PATH).push();
+      const rawStatus = String(row.status ?? row.Status ?? "").trim();
+      const normalizedStatus = LEGACY_OPEN_STATUSES.has(rawStatus)
+        ? normalizeLeadStatus(rawStatus)
+        : "Lead Captured";
+
       await ref.set({
         firstName:        String(row.firstName ?? row["First Name"] ?? ""),
         lastName:         String(row.lastName ?? row["Last Name"] ?? ""),
@@ -776,10 +794,10 @@ export const bulkImportLeads = async (req: AuthRequest, res: Response) => {
         country:          String(row.country ?? row.Country ?? ""),
         region:           VALID_REGIONS.has(String(row.region ?? row.Region ?? "").trim()) ? String(row.region ?? row.Region).trim() : undefined,
         employeeStrength: String(row.employeeStrength ?? row["Employee Count"] ?? row["Employee Strength"] ?? ""),
-        status:           LEGACY_OPEN_STATUSES.has(String(row.status ?? row.Status ?? "").trim()) ? String(row.status ?? row.Status).trim() : "Lead Captured",
-        outcome:          String(row.status ?? row.Status ?? "").trim() === "Won" ? "won" : String(row.status ?? row.Status ?? "").trim() === "Lost" ? "lost" : "open",
-        wonAtStatus:      String(row.status ?? row.Status ?? "").trim() === "Won" ? "Negotiation" : undefined,
-        lostAtStatus:     String(row.status ?? row.Status ?? "").trim() === "Lost" ? "Negotiation" : undefined,
+        status:           normalizedStatus,
+        outcome:          rawStatus === "Won" ? "won" : rawStatus === "Lost" ? "lost" : "open",
+        wonAtStatus:      rawStatus === "Won" ? "Negotiation" : undefined,
+        lostAtStatus:     rawStatus === "Lost" ? "Negotiation" : undefined,
         source:           VALID_SOURCES.includes(String(row.source ?? row["Lead Source"] ?? "").trim()) ? String(row.source ?? row["Lead Source"]).trim() : "other",
         dealValue:        Number(row.dealValue ?? row["Deal Value"]) || 0,
         closingDate:      Number(row.closingDate ?? row["Close Date"] ?? row["Closing Date"]) || 0,
@@ -820,17 +838,19 @@ export const getLead = async (req: AuthRequest, res: Response) => {
 
     const lead = snapshot.val() as ILead;
 
-    if (!canAccessAllLeads(req.user?.role) && !canUserAccessLead(lead, req.user)) {
+      if (!canAccessAllLeads(req.user?.role) && !canUserAccessLead(lead, req.user)) {
       res.status(403).json({ success: false, message: "Not authorized to access this lead" });
       return;
     }
 
+    const normalizedLead = normalizeLeadStatusFields(lead);
+
     const populatedLead = {
         _id: snapshot.key,
-        ...lead,
-        assignedTo: await populateUser(lead.assignedTo || ""),
-        createdBy: await populateUser(lead.createdBy || ""),
-        timeline: await Promise.all((lead.timeline || []).map(async event => ({
+        ...normalizedLead,
+        assignedTo: await populateUser(normalizedLead.assignedTo || ""),
+        createdBy: await populateUser(normalizedLead.createdBy || ""),
+        timeline: await Promise.all((normalizedLead.timeline || []).map(async event => ({
               ...event,
             performedBy: await populateUser(event.performedBy || "")
         })))
@@ -1033,7 +1053,7 @@ export const updateLead = async (req: AuthRequest, res: Response) => {
       nextOutcome = "won";
       delete updates.status;
     } else if (wantsStageChange) {
-      nextStage = requestedStatus as LeadStatus;
+      nextStage = normalizeLeadStatus(requestedStatus);
     }
 
     if (nextOutcome === "open" && currentOutcome !== "open") {
@@ -1068,20 +1088,26 @@ export const updateLead = async (req: AuthRequest, res: Response) => {
     if (nextOutcome !== currentOutcome && nextOutcome !== "open") {
       const stageAtClosure = nextStage;
       const event = nextOutcome === "won" ? "Won" : nextOutcome === "lost" ? "Lost" : "Cancelled";
-      timeline.push({
+      const closureReason = String(
+        nextOutcome === "won"
+          ? (updates.wonReason ?? "")
+          : nextOutcome === "lost"
+            ? (updates.lostReason ?? "")
+            : (updates.cancellationReason ?? "")
+      ).trim();
+      const closureEvent: any = {
         event,
         status: stageAtClosure,
         previousStatus: currentStage,
         outcome: nextOutcome,
-        reason: nextOutcome === "won"
-          ? updates.wonReason
-          : nextOutcome === "lost"
-            ? updates.lostReason
-            : updates.cancellationReason,
         remark: updates.latestRemark || `Lead marked ${nextOutcome} at ${stageAtClosure}`,
         performedBy: req.user.id,
         timestamp: now
-      });
+      };
+      if (closureReason) {
+        closureEvent.reason = closureReason;
+      }
+      timeline.push(closureEvent);
       meaningfulActivity = true;
       updates.closedAt = now;
       if (nextOutcome === "won") {
@@ -1161,7 +1187,7 @@ export const getLeadJourney = async (req: AuthRequest, res: Response) => {
             res.status(404).json({ success: false, message: "Lead not found" });
             return;
         }
-        const leadData = leadSnapshot.val();
+        const leadData = normalizeLeadStatusFields(leadSnapshot.val() as ILead);
 
         // 2. Authorization Check
         if (!canAccessAllLeads(req.user?.role) && !canUserAccessLead(leadData as ILead, req.user)) {
@@ -1170,7 +1196,7 @@ export const getLeadJourney = async (req: AuthRequest, res: Response) => {
         }
 
         // 3. Get Assigned User
-        const assignedUser = await populateRef(USERS_PATH, leadData.assignedTo, ["name", "email", "role"]);
+        const assignedUser = await populateRef(USERS_PATH, leadData.assignedTo || "", ["name", "email", "role"]);
 
         // 4. Get Proposals for this lead
         const proposalsSnapshot = await rtdb.ref(PROPOSALS_PATH).orderByChild("lead").equalTo(id).once("value");

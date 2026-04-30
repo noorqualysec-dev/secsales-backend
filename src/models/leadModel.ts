@@ -126,6 +126,14 @@ export const LEAD_STATUSES = [
     "Negotiation",
 ] as const;
 
+export const LEGACY_LEAD_STATUS_ALIASES = {
+    "Pre-Assessment Form Sent": "Requirement Gathering",
+    "Proposal Preparation": "Proposal Sent",
+} as const;
+
+type LegacyLeadStatus = keyof typeof LEGACY_LEAD_STATUS_ALIASES;
+const LEAD_STATUS_SET = new Set<string>(LEAD_STATUSES);
+
 export const LEAD_OUTCOMES = [
     "open",
     "won",
@@ -136,6 +144,18 @@ export const LEAD_OUTCOMES = [
 export type LeadStatus = typeof LEAD_STATUSES[number];
 export type LeadOutcome = typeof LEAD_OUTCOMES[number];
 export type LeadRegion = typeof LEAD_REGIONS[number];
+export function normalizeLeadStatus(statusRaw: unknown): LeadStatus {
+    const status = String(statusRaw ?? "").trim();
+    if (!status) return "Lead Captured";
+    if (status in LEGACY_LEAD_STATUS_ALIASES) {
+        return LEGACY_LEAD_STATUS_ALIASES[status as LegacyLeadStatus];
+    }
+    if (LEAD_STATUS_SET.has(status)) {
+        return status as LeadStatus;
+    }
+    return "Lead Captured";
+}
+
 /** Preset industry labels for UI dropdowns; custom values still allowed via "Other". */
 export const LEAD_INDUSTRY_PRESETS = [
     "Technology",

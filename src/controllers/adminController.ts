@@ -1,20 +1,17 @@
 import type { Response } from "express";
 import { rtdb } from "../config/firebase.js";
 import type { AuthRequest } from "../middleware/authMiddleware.js";
+import { LEAD_STATUSES, normalizeLeadStatus } from "../models/leadModel.js";
 import type { ILead, LeadOutcome, LeadStatus } from "../models/leadModel.js";
 
 const USERS_PATH = "users";
 const LEADS_PATH = "leads";
 const PROPOSALS_PATH = "proposals";
 const CLOSED_STATUSES = new Set(["Won", "Lost"]);
-const OPEN_PIPELINE_STATUSES = new Set([
-    "Lead Captured",
-    "Discovery Call Scheduled",
-    "Requirement Gathering",
+const OPEN_PIPELINE_STATUSES = new Set<string>([
+    ...LEAD_STATUSES,
     "Pre-Assessment Form Sent",
     "Proposal Preparation",
-    "Proposal Sent",
-    "Negotiation",
 ]);
 
 const getLeadOutcome = (lead: Partial<ILead>): LeadOutcome => {
@@ -29,11 +26,26 @@ const getLeadOutcome = (lead: Partial<ILead>): LeadOutcome => {
 
 const getLeadStage = (lead: Partial<ILead>): LeadStatus => {
     if (lead.status && !CLOSED_STATUSES.has(lead.status)) {
-        return lead.status;
+        return normalizeLeadStatus(lead.status);
     }
-    if (lead.lostAtStatus) return lead.lostAtStatus;
-    if (lead.wonAtStatus) return lead.wonAtStatus;
+    if (lead.lostAtStatus) return normalizeLeadStatus(lead.lostAtStatus);
+    if (lead.wonAtStatus) return normalizeLeadStatus(lead.wonAtStatus);
     return "Lead Captured";
+};
+
+const normalizeLeadStatusFields = <T extends Partial<ILead>>(lead: T): T => {
+    const normalized = { ...lead } as T & Record<string, unknown>;
+    const status = String(lead.status ?? "").trim();
+    if (status && !CLOSED_STATUSES.has(status)) {
+        normalized.status = normalizeLeadStatus(status);
+    }
+    if (lead.lostAtStatus) {
+        normalized.lostAtStatus = normalizeLeadStatus(lead.lostAtStatus);
+    }
+    if (lead.wonAtStatus) {
+        normalized.wonAtStatus = normalizeLeadStatus(lead.wonAtStatus);
+    }
+    return normalized as T;
 };
 
 // Helper for manual "population"
@@ -152,15 +164,8 @@ export const toggleUserStatus = async (req: AuthRequest, res: Response) => {
 
 export const getAllLeads = async (req: AuthRequest, res: Response) => {
     try {
-        const { status } = req.query;
-        let ref = rtdb.ref(LEADS_PATH);
-        let snapshot;
-
-        if (status) {
-            snapshot = await ref.orderByChild("status").equalTo(status as string).once("value");
-        } else {
-            snapshot = await ref.once("value");
-        }
+        const statusFilterRaw = typeof req.query.status === "string" ? req.query.status.trim() : "";
+        const snapshot = await rtdb.ref(LEADS_PATH).once("value");
 
         if (!snapshot.exists()) {
             res.status(200).json({ success: true, count: 0, data: [] });
@@ -169,17 +174,37 @@ export const getAllLeads = async (req: AuthRequest, res: Response) => {
 
         const leadsData = snapshot.val();
         const leads = await Promise.all(Object.keys(leadsData).map(async (key) => {
-            const data = leadsData[key];
+            const data = normalizeLeadStatusFields(leadsData[key] as ILead);
             return {
                 _id: key,
                 ...data,
-                assignedTo: await populateRef(USERS_PATH, data.assignedTo, ["name", "email", "role"])
+                assignedTo: await populateRef(USERS_PATH, data.assignedTo || "", ["name", "email", "role"])
             };
         }));
 
-        leads.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+        const hasStageFilter = Boolean(statusFilterRaw) && statusFilterRaw !== "Won" && statusFilterRaw !== "Lost";
+        if (hasStageFilter && !OPEN_PIPELINE_STATUSES.has(statusFilterRaw)) {
+            res.status(200).json({ success: true, count: 0, data: [] });
+            return;
+        }
 
-        res.status(200).json({ success: true, count: leads.length, data: leads });
+        const normalizedStageFilter = hasStageFilter
+            ? normalizeLeadStatus(statusFilterRaw)
+            : "";
+
+        const filteredLeads = statusFilterRaw
+            ? leads.filter((lead) => {
+                const outcome = getLeadOutcome(lead);
+                if (statusFilterRaw === "Won") return outcome === "won";
+                if (statusFilterRaw === "Lost") return outcome === "lost";
+                if (outcome !== "open") return false;
+                return getLeadStage(lead) === normalizedStageFilter;
+            })
+            : leads;
+
+        filteredLeads.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+
+        res.status(200).json({ success: true, count: filteredLeads.length, data: filteredLeads });
     } catch (error: any) {
         res.status(500).json({ success: false, message: error.message });
     }
@@ -263,7 +288,7 @@ export const updateLeadStatus = async (req: AuthRequest, res: Response) => {
             } else if (requestedStatus === "Lost") {
                 nextOutcome = "lost";
             } else if (OPEN_PIPELINE_STATUSES.has(requestedStatus)) {
-                nextStatus = requestedStatus as LeadStatus;
+                nextStatus = normalizeLeadStatus(requestedStatus);
             } else {
                 res.status(400).json({ success: false, message: "Invalid status" });
                 return;
@@ -284,16 +309,20 @@ export const updateLeadStatus = async (req: AuthRequest, res: Response) => {
         }
 
         if (nextOutcome === "won" || nextOutcome === "lost") {
-            timeline.push({
+            const closureReason = String(nextOutcome === "won" ? (wonReason ?? "") : (lostReason ?? "")).trim();
+            const closureEvent: any = {
                 event: nextOutcome === "won" ? "Won" : "Lost",
                 status: nextStatus,
                 previousStatus: oldStatus,
                 outcome: nextOutcome,
-                reason: nextOutcome === "won" ? wonReason : lostReason,
                 performedBy: req.user!.id,
                 remark: String(latestRemark ?? "").trim() || `Lead marked ${nextOutcome} at [${nextStatus}] via Admin Kanban`,
                 timestamp: now
-            });
+            };
+            if (closureReason) {
+                closureEvent.reason = closureReason;
+            }
+            timeline.push(closureEvent);
             updates.status = nextStatus;
             updates.outcome = nextOutcome;
             updates.closedAt = now;
@@ -354,17 +383,9 @@ export const getLeadStats = async (req: AuthRequest, res: Response) => {
             return;
         }
 
-        const stats: Record<string, number> = {
-            "Lead Captured": 0,
-            "Discovery Call Scheduled": 0,
-            "Requirement Gathering": 0,
-            "Pre-Assessment Form Sent": 0,
-            "Proposal Preparation": 0,
-            "Proposal Sent": 0,
-            "Negotiation": 0,
-            "Won": 0,
-            "Lost": 0
-        };
+        const stats = Object.fromEntries(
+            [...LEAD_STATUSES, "Won", "Lost"].map((status) => [status, 0])
+        ) as Record<string, number>;
 
         const leads = snapshot.val();
         Object.values(leads).forEach((lead: any) => {
@@ -396,10 +417,10 @@ export const getLeadJourney = async (req: AuthRequest, res: Response) => {
             res.status(404).json({ success: false, message: "Lead not found" });
             return;
         }
-        const leadData = leadSnapshot.val();
+        const leadData = normalizeLeadStatusFields(leadSnapshot.val() as ILead);
 
         // 2. Get Assigned User
-        const assignedUser = await populateRef(USERS_PATH, leadData.assignedTo, ["name", "email", "role"]);
+        const assignedUser = await populateRef(USERS_PATH, leadData.assignedTo || "", ["name", "email", "role"]);
 
         // 3. Get Proposals for this lead
         const proposalsSnapshot = await rtdb.ref(PROPOSALS_PATH).orderByChild("lead").equalTo(id).once("value");
