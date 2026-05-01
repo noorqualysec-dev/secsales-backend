@@ -36,7 +36,7 @@ export interface ITask {
   status: TaskStatus;
   priority: TaskPriority;
 
-  assignedTo: string; // sales rep user id
+  assignedTo: string[]; // assignee user ids
   assignedBy: string; // who assigned the task
   createdBy: string; // who created it
 

@@ -29,9 +29,25 @@ const canAccessMeeting = (user: AuthRequest["user"], meeting: any): boolean => {
     return USER_ROLES_WITH_GLOBAL_MEETING_ACCESS.has(user.role) || meeting.assignedTo === user.id;
 };
 
+const normalizeTaskAssigneeIds = (assignedTo: unknown): string[] => {
+    const rawAssignees = Array.isArray(assignedTo) ? assignedTo : [assignedTo];
+    const uniqueAssignees: string[] = [];
+
+    for (const assignee of rawAssignees) {
+        const assigneeId = String(assignee || "").trim();
+        if (!assigneeId || uniqueAssignees.includes(assigneeId)) continue;
+        uniqueAssignees.push(assigneeId);
+    }
+
+    return uniqueAssignees;
+};
+
+const taskHasAssignee = (task: any, userId: string): boolean =>
+    normalizeTaskAssigneeIds(task?.assignedTo).includes(userId);
+
 const canAccessTask = (user: AuthRequest["user"], task: any): boolean => {
     if (!user) return false;
-    return USER_ROLES_WITH_GLOBAL_TASK_ACCESS.has(user.role) || task.assignedTo === user.id || task.createdBy === user.id;
+    return USER_ROLES_WITH_GLOBAL_TASK_ACCESS.has(user.role) || taskHasAssignee(task, user.id) || task.createdBy === user.id;
 };
 
 const canDeleteTask = (user: AuthRequest["user"], task: any): boolean => {
@@ -204,14 +220,32 @@ const buildTaskResponse = (
     users: Record<string, any> = {}
 ) => {
     const lead = task.leadId ? leads[task.leadId] : null;
-    const assignee = task.assignedTo ? users[task.assignedTo] : null;
+    const assigneeIds = normalizeTaskAssigneeIds(task.assignedTo);
+    const assignees = assigneeIds
+        .map((assigneeId) => {
+            const assignee = users[assigneeId];
+            if (!assignee) return null;
+            return {
+                _id: assigneeId,
+                name: assignee.name,
+                email: assignee.email,
+                role: assignee.role,
+            };
+        })
+        .filter(Boolean) as Array<{ _id: string; name?: string; email?: string; role?: string }>;
+    const assigneeNames = assignees
+        .map((assignee) => String(assignee.name || "").trim())
+        .filter(Boolean);
     const creator = task.createdBy ? users[task.createdBy] : null;
 
     return {
         ...task,
+        assignedTo: assigneeIds,
         leadName: lead ? `${lead.firstName || ""} ${lead.lastName || ""}`.trim() : undefined,
         company: lead?.company || undefined,
-        assignedToName: assignee?.name,
+        assignedToName: assigneeNames.join(", "),
+        assignedToNames: assigneeNames,
+        assignedToUsers: assignees,
         assignedByName: task.assignedBy ? users[task.assignedBy]?.name : undefined,
         createdByName: creator?.name,
         lead: lead
@@ -258,8 +292,9 @@ const addLeadTimelineEntry = async (leadId: string, remark: string, performedBy:
 
 const GLOBAL_TASK_ASSIGNABLE_ROLES = new Set(["sales_rep", "manager"]);
 
-const resolveTaskSource = (creatorRole: string, createdBy: string, assignedTo: string): TaskSource => {
-    if (assignedTo === createdBy) return "self";
+const resolveTaskSource = (creatorRole: string, createdBy: string, assignedTo: string[]): TaskSource => {
+    const assigneeIds = normalizeTaskAssigneeIds(assignedTo);
+    if (assigneeIds.length === 1 && assigneeIds[0] === createdBy) return "self";
     return creatorRole === "admin" || creatorRole === "manager" ? "admin" : "self";
 };
 
@@ -282,7 +317,11 @@ export const getSalesSummary = async (req: AuthRequest, res: Response) => {
         const meetings = meetingsSnap.val() || {};
 
         const leadsWithIds = Object.entries(leads).map(([id, lead]: [string, any]) => ({ ...lead, id, _id: id }));
-        const tasksWithIds = Object.entries(tasks).map(([id, task]: [string, any]) => ({ ...task, id }));
+        const tasksWithIds = Object.entries(tasks).map(([id, task]: [string, any]) => ({
+            ...task,
+            id,
+            assignedTo: normalizeTaskAssigneeIds(task?.assignedTo),
+        }));
         const meetingsWithIds = Object.entries(meetings).map(([id, meeting]: [string, any]) => ({ ...meeting, id }));
         const myLeads = leadsWithIds.filter((lead: any) => lead.assignedTo === userId);
 
@@ -304,10 +343,10 @@ export const getSalesSummary = async (req: AuthRequest, res: Response) => {
             ).length,
             totalMyLeads: myLeads.length,
             allTasks: tasksWithIds
-                .filter((task: any) => task.assignedTo === userId)
+                .filter((task: any) => taskHasAssignee(task, userId))
                 .map(attachLead),
             openTasks: tasksWithIds
-                .filter((task: any) => task.assignedTo === userId && task.status !== "Completed")
+                .filter((task: any) => taskHasAssignee(task, userId) && task.status !== "Completed")
                 .map(attachLead),
             meetings: meetingsWithIds
                 .filter((meeting: any) =>
@@ -378,9 +417,9 @@ export const getTasks = async (req: AuthRequest, res: Response) => {
         let items = Object.entries(tasks).map(([id, task]: [string, any]) => ({ ...task, id }));
 
         if (!USER_ROLES_WITH_GLOBAL_TASK_ACCESS.has(req.user!.role)) {
-            items = items.filter((task: any) => task.assignedTo === req.user!.id || task.createdBy === req.user!.id);
+            items = items.filter((task: any) => taskHasAssignee(task, req.user!.id) || task.createdBy === req.user!.id);
         } else if (assignedTo) {
-            items = items.filter((task: any) => task.assignedTo === assignedTo);
+            items = items.filter((task: any) => taskHasAssignee(task, assignedTo));
         }
 
         if (status) items = items.filter((task: any) => task.status === status);
@@ -528,22 +567,36 @@ export const updateTask = async (req: AuthRequest, res: Response) => {
                 return;
             }
 
-            const assignedTo = String(req.body.assignedTo || "").trim();
-            if (!assignedTo) {
-                res.status(400).json({ success: false, message: "Assigned user is required" });
+            const assignedTo = normalizeTaskAssigneeIds(req.body.assignedTo);
+            if (!assignedTo.length) {
+                res.status(400).json({ success: false, message: "At least one assignee is required" });
                 return;
             }
 
-            const assignedUser = await fetchUserById(assignedTo);
-            if (!assignedUser) {
-                res.status(404).json({ success: false, message: "Assigned user not found" });
+            const assignedUsers = await Promise.all(
+                assignedTo.map(async (assigneeId) => ({
+                    assigneeId,
+                    user: await fetchUserById(assigneeId),
+                }))
+            );
+            const missingAssignee = assignedUsers.find((assignee) => !assignee.user);
+            if (missingAssignee) {
+                res.status(404).json({ success: false, message: `Assigned user not found: ${missingAssignee.assigneeId}` });
+                return;
+            }
+
+            const invalidAssignee = assignedUsers.find(
+                (assignee) => !GLOBAL_TASK_ASSIGNABLE_ROLES.has(String(assignee.user?.role || ""))
+            );
+            if (invalidAssignee) {
+                res.status(400).json({ success: false, message: "Tasks can only be assigned to sales reps or managers" });
                 return;
             }
 
             updates.assignedTo = assignedTo;
             updates.assignedBy = req.user!.id;
             updates.source = resolveTaskSource(req.user!.role, existingTask.createdBy, assignedTo);
-            updates.isRead = assignedTo === req.user!.id;
+            updates.isRead = assignedTo.includes(req.user!.id);
         }
 
         if (req.body.completionRemark !== undefined) {
@@ -709,32 +762,44 @@ export const createTask = async (req: AuthRequest, res: Response) => {
             return;
         }
 
-        let assignedTo = userId;
+        let assignedTo = [userId];
         if (req.body.assignedTo !== undefined) {
-            const requestedAssignee = String(req.body.assignedTo || "").trim();
+            const requestedAssignees = normalizeTaskAssigneeIds(req.body.assignedTo);
 
-            if (!requestedAssignee) {
-                res.status(400).json({ success: false, message: "Assigned user is required" });
+            if (!requestedAssignees.length) {
+                res.status(400).json({ success: false, message: "At least one assignee is required" });
                 return;
             }
 
-            if (!USER_ROLES_WITH_GLOBAL_TASK_ACCESS.has(userRole) && requestedAssignee !== userId) {
+            if (
+                !USER_ROLES_WITH_GLOBAL_TASK_ACCESS.has(userRole) &&
+                (requestedAssignees.length !== 1 || requestedAssignees[0] !== userId)
+            ) {
                 res.status(403).json({ success: false, message: "Sales reps can only create tasks for themselves" });
                 return;
             }
 
-            const assignedUser = await fetchUserById(requestedAssignee);
-            if (!assignedUser) {
-                res.status(404).json({ success: false, message: "Assigned user not found" });
+            const assignedUsers = await Promise.all(
+                requestedAssignees.map(async (assigneeId) => ({
+                    assigneeId,
+                    user: await fetchUserById(assigneeId),
+                }))
+            );
+            const missingAssignee = assignedUsers.find((assignee) => !assignee.user);
+            if (missingAssignee) {
+                res.status(404).json({ success: false, message: `Assigned user not found: ${missingAssignee.assigneeId}` });
                 return;
             }
 
-            if (USER_ROLES_WITH_GLOBAL_TASK_ACCESS.has(userRole) && !GLOBAL_TASK_ASSIGNABLE_ROLES.has(assignedUser.role)) {
+            if (
+                USER_ROLES_WITH_GLOBAL_TASK_ACCESS.has(userRole) &&
+                assignedUsers.some((assignee) => !GLOBAL_TASK_ASSIGNABLE_ROLES.has(String(assignee.user?.role || "")))
+            ) {
                 res.status(400).json({ success: false, message: "Tasks can only be assigned to sales reps or managers" });
                 return;
             }
 
-            assignedTo = requestedAssignee;
+            assignedTo = requestedAssignees;
         }
 
         let normalizedLeadId: string | undefined;
@@ -760,7 +825,7 @@ export const createTask = async (req: AuthRequest, res: Response) => {
             assignedBy: userId,
             createdBy: userId,
             source,
-            isRead: assignedTo === userId,
+            isRead: assignedTo.includes(userId),
             createdAt: Date.now(),
             updatedAt: Date.now(),
             ...(normalizedLeadId ? { leadId: normalizedLeadId } : {}),
