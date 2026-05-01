@@ -12,6 +12,8 @@ export interface ITimelineEvent {
 export const LEAD_REGIONS = [
     "India",
     "Middle-East",
+    "Europe",
+    "Africa",
     "North-America",
     "SouthEast-Asia",
     "Australia",
@@ -21,7 +23,7 @@ export const LEAD_REGIONS = [
 export interface LeadContact {
     id: string;
     firstName: string;
-    lastName: string;
+    lastName?: string;
     fullName?: string; // optional computed/helper field
     email: string;
     phone?: string;
@@ -55,7 +57,7 @@ export interface LeadContact {
 export interface ILead {
     id?: string;
     firstName: string;
-    lastName: string;
+    lastName?: string;
     email: string;
     designation?: string;
     employeeStrength?: "1-10" | "11-50" | "51-200" | "201-500" | "501-1000" | "1000+";

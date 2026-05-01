@@ -59,7 +59,6 @@ if (!sheet) {
 function validateMappedLead(lead: ILead): string | null {
     if (!lead.email) return "Missing email";
     if (!lead.firstName) return "Missing first name";
-    if (!lead.lastName) return "Missing last name";
     if (!lead.status) return "Missing status";
     if (!lead.outcome) return "Missing outcome";
     if (!lead.source) return "Missing source";
