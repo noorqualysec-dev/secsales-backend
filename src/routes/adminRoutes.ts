@@ -11,6 +11,10 @@ import {
     getLeadJourney,
     getAllProposals,
 } from "../controllers/adminController.js";
+import {
+    downloadCombinedSalesRepReport,
+    downloadIndividualSalesRepReport,
+} from "../controllers/reportController.js";
 
 const router = express.Router();
 
@@ -31,5 +35,7 @@ router.put("/leads/:id/status", updateLeadStatus);
 
 // ── Proposal management ──────────────────────────────────────────────────────
 router.get("/proposals", getAllProposals);
+router.get("/reports/sales-reps/download", downloadCombinedSalesRepReport);
+router.get("/reports/sales-reps/:userId/download", downloadIndividualSalesRepReport);
 
 export default router;
