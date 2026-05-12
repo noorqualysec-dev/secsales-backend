@@ -23,6 +23,15 @@ const ALLOWED_TASK_PRIORITIES = new Set<string>(TASK_PRIORITIES);
 const getMeetingStartTime = (meeting: any): number => Number(meeting.startTime ?? meeting.from ?? 0);
 const getMeetingEndTime = (meeting: any): number => Number(meeting.endTime ?? meeting.to ?? 0);
 const getMeetingSubject = (meeting: any): string => String(meeting.subject ?? meeting.title ?? "");
+const getLeadOutcome = (lead: any): "open" | "won" | "lost" | "cancelled" => {
+    const outcome = String(lead?.outcome || "").trim().toLowerCase();
+    if (outcome === "won" || outcome === "lost" || outcome === "cancelled") return outcome;
+    if (lead?.status === "Won") return "won";
+    if (lead?.status === "Lost") return "lost";
+    return "open";
+};
+
+const getLeadClosedAt = (lead: any): number => Number(lead?.closedAt || lead?.closingDate || lead?.updatedAt || 0);
 
 const canAccessMeeting = (user: AuthRequest["user"], meeting: any): boolean => {
     if (!user) return false;
@@ -333,8 +342,18 @@ export const getSalesSummary = async (req: AuthRequest, res: Response) => {
             return item;
         };
 
+        const now = new Date();
+        const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1).getTime();
+        const endOfMonth = new Date(now.getFullYear(), now.getMonth() + 1, 1).getTime() - 1;
+        const wonDeals = myLeads.filter((lead: any) => getLeadOutcome(lead) === "won");
+
         const stats = {
-            openDeals: myLeads.filter((lead: any) => !["Won", "Lost"].includes(lead.status)).length,
+            openDeals: myLeads.filter((lead: any) => getLeadOutcome(lead) === "open").length,
+            wonDeals: wonDeals.length,
+            wonDealsThisMonth: wonDeals.filter((lead: any) => {
+                const closedAt = getLeadClosedAt(lead);
+                return closedAt >= startOfMonth && closedAt <= endOfMonth;
+            }),
             untouchedDeals: myLeads.filter((lead: any) => !lead.timeline || lead.timeline.length <= 1).length,
             callsToday: meetingsWithIds.filter((meeting: any) =>
                 meeting.assignedTo === userId &&
@@ -353,14 +372,16 @@ export const getSalesSummary = async (req: AuthRequest, res: Response) => {
                     meeting.assignedTo === userId &&
                     getMeetingStartTime(meeting) >= filterStart &&
                     getMeetingStartTime(meeting) <= filterEnd
-                )
+            )
                 .map((meeting: any) => attachLead(buildMeetingResponse(meeting, leads))),
             todaysLeads: myLeads.filter((lead: any) => lead.createdAt >= startOfToday),
             dealsClosingThisMonth: myLeads.filter((lead: any) => {
                 const closingDate = lead.closingDate || 0;
-                const startOfMonth = new Date(new Date().getFullYear(), new Date().getMonth(), 1).getTime();
-                const endOfMonth = new Date(new Date().getFullYear(), new Date().getMonth() + 1, 0).getTime();
-                return closingDate >= startOfMonth && closingDate <= endOfMonth;
+                if (getLeadOutcome(lead) === "won") {
+                    const closedAt = getLeadClosedAt(lead);
+                    return closedAt >= startOfMonth && closedAt <= endOfMonth;
+                }
+                return getLeadOutcome(lead) === "open" && closingDate >= startOfMonth && closingDate <= endOfMonth;
             }),
         };
 
