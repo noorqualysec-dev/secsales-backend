@@ -68,6 +68,17 @@ function normalizeIndustry(indRaw: unknown): { error: string } | { industry: str
     return { industry: s || undefined };
 }
 
+function normalizeCountry(countryRaw: unknown): { error: string } | { country: string | undefined } {
+    if (countryRaw === undefined || countryRaw === null) {
+        return { country: undefined };
+    }
+    const s = String(countryRaw).trim();
+    if (s.length > 80) {
+        return { error: "Country must be at most 80 characters." };
+    }
+    return { country: s || undefined };
+}
+
 function applyNormalizedPhoneToLeadData(leadData: Partial<ILead>, norm: { phoneCountryCode: string; phone: string }) {
     if (!norm.phoneCountryCode && !norm.phone) {
         delete leadData.phoneCountryCode;
@@ -593,6 +604,19 @@ export const createLead = async (req: AuthRequest, res: Response) => {
       }
     }
 
+    if (Object.prototype.hasOwnProperty.call(leadData, "country")) {
+      const countryNorm = normalizeCountry(leadData.country);
+      if ("error" in countryNorm) {
+        res.status(400).json({ success: false, message: countryNorm.error });
+        return;
+      }
+      if (countryNorm.country !== undefined) {
+        leadData.country = countryNorm.country;
+      } else {
+        delete leadData.country;
+      }
+    }
+
     if (Object.prototype.hasOwnProperty.call(leadData, "region")) {
       const regionNorm = normalizeRegion(leadData.region);
       if ("error" in regionNorm) {
@@ -823,7 +847,7 @@ export const bulkImportLeads = async (req: AuthRequest, res: Response) => {
         designation:      String(row.designation ?? row.Position ?? ""),
         company:          String(row.company ?? row.Company ?? ""),
         industry:         String(row.industry ?? row["Industry Vertical"] ?? row["Industrial Vertical"] ?? ""),
-        country:          String(row.country ?? row.Country ?? ""),
+        country:          String(row.country ?? row.Country ?? "").trim() || undefined,
         region:           VALID_REGIONS.has(String(row.region ?? row.Region ?? "").trim()) ? String(row.region ?? row.Region).trim() : undefined,
         employeeStrength: String(row.employeeStrength ?? row["Employee Count"] ?? row["Employee Strength"] ?? ""),
         status:           normalizedStatus,
@@ -1029,6 +1053,15 @@ export const updateLead = async (req: AuthRequest, res: Response) => {
         return;
       }
       updates.industry = indNorm.industry;
+    }
+
+    if (Object.prototype.hasOwnProperty.call(req.body, "country")) {
+      const countryNorm = normalizeCountry(req.body.country);
+      if ("error" in countryNorm) {
+        res.status(400).json({ success: false, message: countryNorm.error });
+        return;
+      }
+      updates.country = countryNorm.country ?? null;
     }
 
     if (Object.prototype.hasOwnProperty.call(req.body, "region")) {
