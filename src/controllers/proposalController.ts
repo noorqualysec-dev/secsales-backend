@@ -1,313 +1,435 @@
 import type { Response } from "express";
-import { rtdb } from "../config/firebase.js";
+import mongoose, { Types } from "mongoose";
 import type { AuthRequest } from "../middleware/authMiddleware.js";
-import type { IProposal } from "../models/proposalModel.js";
-import type { ILead, LeadOutcome, LeadStatus } from "../models/leadModel.js";
-import { canAccessAllProposals } from "../utils/roles.js";
+import { AuditEvent, Lead, NegotiationEvent, Proposal, ProposalRevision } from "../models/mongoModels.js";
+import { PROPOSAL_STATUSES } from "../models/proposalModel.js";
+import { getNextLeadReminderAt } from "../services/reminderPolicy.js";
 
-const PROPOSALS_PATH = "proposals";
-const LEADS_PATH = "leads";
-const USERS_PATH = "users";
-const CLOSED_STATUSES = new Set(["Won", "Lost"]);
-const normalizeTestingScope = (value: unknown): string[] =>
-  Array.isArray(value) ? value.filter((scope): scope is string => typeof scope === "string") : [];
+const hasGlobalAccess = (role: unknown): boolean => role === "admin" || role === "manager";
+const validId = (value: string): boolean => Types.ObjectId.isValid(value);
+const isProposalStatus = (value: unknown): value is typeof PROPOSAL_STATUSES[number] =>
+  typeof value === "string" && PROPOSAL_STATUSES.includes(value as typeof PROPOSAL_STATUSES[number]);
 
-const getLeadStage = (lead: Partial<ILead>): LeadStatus => {
-    if (lead.status && !CLOSED_STATUSES.has(lead.status)) {
-        return lead.status;
-    }
-    if (lead.lostAtStatus) return lead.lostAtStatus;
-    if (lead.wonAtStatus) return lead.wonAtStatus;
-    return "Lead Captured";
-};
+async function canAccessLead(user: NonNullable<AuthRequest["user"]>, leadId: string): Promise<boolean> {
+  if (hasGlobalAccess(user.role)) return true;
+  return Boolean(await Lead.exists({
+    _id: leadId,
+    $or: [{ assignedTo: user.id }, { createdBy: user.id }],
+  }));
+}
 
-// Helper for manual "population"
-const populateRef = async (path: string, id: string, fields: string[]) => {
-    if (!id) return null;
-    const snapshot = await rtdb.ref(`${path}/${id}`).once("value");
-    if (!snapshot.exists()) return null;
-    const data = snapshot.val();
-    const result: any = { _id: snapshot.key };
-    fields.forEach(f => { result[f] = data?.[f]; });
-    return result;
-};
+function parseRevision(body: Record<string, unknown>) {
+  const scopeRaw = body.testingScope ?? body.scope;
+  const scope = Array.isArray(scopeRaw)
+    ? scopeRaw.filter((item): item is string => typeof item === "string").map((item) => item.trim()).filter(Boolean)
+    : [];
+  const valueRaw = body.value;
+  let value: string | undefined;
+  if (valueRaw !== undefined && valueRaw !== null && valueRaw !== "") {
+    value = String(valueRaw).trim();
+    if (!/^\d+(\.\d{1,2})?$/.test(value)) throw new Error("Proposal value must be a non-negative amount with at most 2 decimal places");
+  }
+  const currency = body.currency === undefined ? undefined : String(body.currency).trim().toUpperCase();
+  if (value !== undefined && (!currency || !/^[A-Z]{3}$/.test(currency))) {
+    throw new Error("A three-letter ISO currency code is required with proposal value");
+  }
+  return {
+    scope,
+    ...(value !== undefined ? { value: mongoose.Types.Decimal128.fromString(value) } : {}),
+    ...(currency ? { currency } : {}),
+    ...(body.commercialTerms !== undefined ? { commercialTerms: String(body.commercialTerms).trim() } : {}),
+    ...(body.notes !== undefined ? { notes: String(body.notes).trim() } : {}),
+    ...(body.reason !== undefined ? { reason: String(body.reason).trim() } : {}),
+    ...(body.customerRequestOrResponse !== undefined
+      ? { customerRequestOrResponse: String(body.customerRequestOrResponse).trim() }
+      : {}),
+    ...(Array.isArray(body.testingServices) ? { testingServices: body.testingServices } : {}),
+  };
+}
 
-// @desc    Get proposals
-export const getProposals = async (req: AuthRequest, res: Response) => {
+export async function proposalResponse(proposalId: Types.ObjectId | string) {
+  const proposal = await Proposal.findById(proposalId)
+    .populate("leadId", "firstName lastName company email status outcome")
+    .populate("createdBy", "name email")
+    .lean();
+  if (!proposal) return null;
+  const [currentRevision, revisions, negotiationEvents] = await Promise.all([
+    proposal.currentRevisionId ? ProposalRevision.findById(proposal.currentRevisionId).lean() : null,
+    ProposalRevision.find({ proposalId: proposal._id }).sort({ revisionNumber: 1 }).lean(),
+    NegotiationEvent.find({ proposalId: proposal._id })
+      .populate("actorId", "name email")
+      .populate("revisionId", "revisionNumber")
+      .sort({ occurredAt: 1 })
+      .lean(),
+  ]);
+  return {
+    ...proposal,
+    lead: proposal.leadId,
+    leadId: proposal.leadId,
+    currentRevision,
+    revisions,
+    negotiationEvents,
+  };
+}
+
+export const getProposals = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
-    let ref = rtdb.ref(PROPOSALS_PATH);
-    let snapshot;
-
-    if (!canAccessAllProposals(req.user?.role)) {
-      snapshot = await ref.orderByChild("createdBy").equalTo(req.user.id).once("value");
-    } else {
-      snapshot = await ref.orderByChild("createdAt").once("value");
+    let leadFilter = {};
+    if (!hasGlobalAccess(req.user?.role)) {
+      const leads = await Lead.find({
+        $or: [{ assignedTo: req.user?.id }, { createdBy: req.user?.id }],
+      }).select("_id").lean();
+      leadFilter = { leadId: { $in: leads.map((lead) => lead._id) } };
     }
-
-    if (!snapshot.exists()) {
-        res.status(200).json({ success: true, count: 0, data: [] });
-        return;
-    }
-
-    const proposalsData = snapshot.val();
-    const proposals = await Promise.all(Object.keys(proposalsData).map(async (key) => {
-        const data = proposalsData[key];
-        return {
-            _id: key,
-            ...data,
-            testingScope: normalizeTestingScope(data.testingScope),
-            lead: await populateRef(LEADS_PATH, data.lead, ["firstName", "lastName", "company"]),
-            createdBy: await populateRef(USERS_PATH, data.createdBy, ["name", "email"])
-        };
-    }));
-
-    proposals.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
-
-    res.status(200).json({ success: true, count: proposals.length, data: proposals });
-  } catch (error: any) {
-    res.status(500).json({ success: false, message: error.message });
+    const proposals = await Proposal.find(leadFilter).sort({ updatedAt: -1 }).select("_id").lean();
+    const data = await Promise.all(proposals.map((proposal) => proposalResponse(proposal._id)));
+    res.status(200).json({ success: true, count: data.length, data: data.filter(Boolean) });
+  } catch (error) {
+    console.error("Proposal list failed:", error);
+    res.status(500).json({ success: false, message: "Failed to retrieve proposals" });
   }
 };
 
-// @desc    Create new proposal
-export const createProposal = async (req: AuthRequest, res: Response) => {
+export const createProposal = async (req: AuthRequest, res: Response): Promise<void> => {
+  const leadId = String(req.body.leadId ?? req.body.lead ?? "");
+  if (!validId(leadId)) {
+    res.status(400).json({ success: false, message: "A valid lead ID is required" });
+    return;
+  }
+  if (req.body.status !== undefined && req.body.status !== "Draft") {
+    res.status(400).json({ success: false, message: "A proposal must be saved as Draft; use the explicit send action to send it" });
+    return;
+  }
+  if (!(await canAccessLead(req.user!, leadId))) {
+    res.status(403).json({ success: false, message: "Not authorized to create a proposal for this lead" });
+    return;
+  }
+
+  const session = await mongoose.startSession();
+  let createdId: Types.ObjectId | undefined;
   try {
-    const { lead: leadId, value, testingScope, status, notes } = req.body;
-    const normalizedTestingScope = normalizeTestingScope(testingScope);
-
-    const leadRef = rtdb.ref(`${LEADS_PATH}/${leadId}`);
-    const leadSnapshot = await leadRef.once("value");
-
-    if (!leadSnapshot.exists()) {
-      res.status(404).json({ success: false, message: "Lead not found" });
+    await session.withTransaction(async () => {
+      const lead = await Lead.findById(leadId).session(session);
+      if (!lead || lead.outcome !== "open") throw new Error("An open lead is required");
+      const revisionData = parseRevision(req.body);
+      const [proposal] = await Proposal.create([{
+        leadId: lead._id,
+        status: "Draft",
+        currentRevisionNumber: 1,
+        createdBy: req.user!.id,
+      }], { session });
+      if (!proposal) throw new Error("Failed to create canonical proposal");
+      const [revision] = await ProposalRevision.create([{
+        ...revisionData,
+        proposalId: proposal._id,
+        leadId: lead._id,
+        revisionNumber: 1,
+        statusAtCreation: "Draft",
+        preparedBy: req.user!.id,
+        preparedAt: new Date(),
+      }], { session });
+      if (!revision) throw new Error("Failed to create proposal revision");
+      proposal.currentRevisionId = revision._id;
+      await proposal.save({ session });
+      createdId = proposal._id;
+    });
+    const data = createdId ? await proposalResponse(createdId) : null;
+    res.status(201).json({ success: true, data });
+  } catch (error) {
+    if ((error as { code?: number }).code === 11000) {
+      res.status(409).json({ success: false, message: "This lead already has a canonical proposal" });
       return;
     }
-
-    const leadData = leadSnapshot.val();
-    if (leadData?.assignedTo !== req.user.id && !canAccessAllProposals(req.user?.role)) {
-      res.status(403).json({ success: false, message: "Not authorized to create a proposal for this lead" });
-      return;
-    }
-
-    const proposalData: IProposal = {
-      lead: leadId,
-      value,
-      testingScope: normalizedTestingScope,
-      status: status || "Draft",
-      notes,
-      createdBy: req.user.id,
-      createdAt: Date.now(),
-      updatedAt: Date.now(),
-    };
-
-    const newProposalRef = rtdb.ref(PROPOSALS_PATH).push();
-    await newProposalRef.set(proposalData);
-
-    if (proposalData.status) {
-        const leadStatusMap: Record<string, string> = {
-          "Sent": "Proposal Sent",
-          "Accepted": "Won",
-          "Rejected": "Lost",
-          "In Negotiation": "Negotiation"
-        };
-        const newLeadStatus = leadStatusMap[proposalData.status];
-        if (newLeadStatus && newLeadStatus !== leadData.status) {
-            const timeline = [...(leadData.timeline || [])];
-            const now = Date.now();
-            if (newLeadStatus === "Won" || newLeadStatus === "Lost") {
-                const stageAtClosure = getLeadStage(leadData);
-                const outcome: LeadOutcome = newLeadStatus === "Won" ? "won" : "lost";
-                timeline.push({
-                    event: newLeadStatus,
-                    status: stageAtClosure,
-                    previousStatus: stageAtClosure,
-                    outcome,
-                    remark: `Lead marked ${outcome} at ${stageAtClosure} via Proposal`,
-                    performedBy: req.user.id,
-                    timestamp: now
-                });
-                await leadRef.update({
-                    status: stageAtClosure,
-                    outcome,
-                    wonAtStatus: outcome === "won" ? stageAtClosure : null,
-                    lostAtStatus: outcome === "lost" ? stageAtClosure : null,
-                    closedAt: now,
-                    wasEverWon: outcome === "won" ? true : leadData.wasEverWon || false,
-                    timeline,
-                    updatedAt: now
-                });
-            } else {
-                timeline.push({
-                    event: "Status Changed",
-                    status: newLeadStatus,
-                    previousStatus: getLeadStage(leadData),
-                    outcome: "open",
-                    remark: `Status updated to ${newLeadStatus} via Proposal`,
-                    performedBy: req.user.id,
-                    timestamp: now
-                });
-                await leadRef.update({
-                    status: newLeadStatus,
-                    outcome: "open",
-                    timeline,
-                    updatedAt: now
-                });
-            }
-        }
-    }
-
-    res.status(201).json({ success: true, data: { _id: newProposalRef.key, ...proposalData } });
-  } catch (error: any) {
-    res.status(400).json({ success: false, message: error.message });
+    const message = error instanceof Error ? error.message : "Proposal creation failed";
+    const status = message === "An open lead is required" ? 409 : 400;
+    res.status(status).json({ success: false, message });
+  } finally {
+    await session.endSession();
   }
 };
 
-// @desc    Get single proposal
-export const getProposal = async (req: AuthRequest, res: Response) => {
+export const getProposal = async (req: AuthRequest, res: Response): Promise<void> => {
+  const id = String(req.params.id ?? "");
+  if (!validId(id)) {
+    res.status(400).json({ success: false, message: "Invalid proposal ID" });
+    return;
+  }
   try {
-    const id = req.params.id as string;
-    const snapshot = await rtdb.ref(`${PROPOSALS_PATH}/${id}`).once("value");
-
-    if (!snapshot.exists()) {
+    const proposal = await Proposal.findById(id).select("leadId");
+    if (!proposal) {
       res.status(404).json({ success: false, message: "Proposal not found" });
       return;
     }
-
-    const proposal = snapshot.val() as IProposal;
-
-    if (proposal.createdBy !== req.user.id && !canAccessAllProposals(req.user?.role)) {
+    if (!(await canAccessLead(req.user!, proposal.leadId.toString()))) {
       res.status(403).json({ success: false, message: "Not authorized to access this proposal" });
       return;
     }
-
-    const populated = {
-        _id: snapshot.key,
-        ...proposal,
-        testingScope: normalizeTestingScope(proposal.testingScope),
-        lead: await populateRef(LEADS_PATH, proposal.lead, ["firstName", "lastName", "company"]),
-        createdBy: await populateRef(USERS_PATH, proposal.createdBy, ["name", "email"])
-    };
-
-    res.status(200).json({ success: true, data: populated });
-  } catch (error: any) {
-    res.status(500).json({ success: false, message: error.message });
+    res.status(200).json({ success: true, data: await proposalResponse(id) });
+  } catch (error) {
+    console.error("Proposal retrieval failed:", error);
+    res.status(500).json({ success: false, message: "Failed to retrieve proposal" });
   }
 };
 
-// @desc    Update proposal
-export const updateProposal = async (req: AuthRequest, res: Response) => {
+export const updateProposal = async (req: AuthRequest, res: Response): Promise<void> => {
+  const id = String(req.params.id ?? "");
+  if (!validId(id)) {
+    res.status(400).json({ success: false, message: "Invalid proposal ID" });
+    return;
+  }
+  if (req.body.status !== undefined || req.body.lead !== undefined || req.body.leadId !== undefined || req.body.createdBy !== undefined) {
+    res.status(400).json({ success: false, message: "Proposal status and relationship fields cannot be changed through this endpoint" });
+    return;
+  }
+  const session = await mongoose.startSession();
   try {
-    const id = req.params.id as string;
-    const propRef = rtdb.ref(`${PROPOSALS_PATH}/${id}`);
-    const snapshot = await propRef.once("value");
+    await session.withTransaction(async () => {
+      const proposal = await Proposal.findById(id).session(session);
+      if (!proposal) throw new Error("Proposal not found");
+      if (!(await canAccessLead(req.user!, proposal.leadId.toString()))) throw new Error("Not authorized");
+      const lead = await Lead.findById(proposal.leadId).session(session);
+      if (!lead || lead.outcome !== "open") throw new Error("Proposal cannot be edited for a closed lead");
+      const previousStatus = proposal.status;
+      const revisionData = parseRevision(req.body);
+      const revision = await ProposalRevision.create([{
+        ...revisionData,
+        proposalId: proposal._id,
+        leadId: proposal.leadId,
+        revisionNumber: (proposal.currentRevisionNumber ?? 0) + 1,
+        statusAtCreation: proposal.status,
+        preparedBy: req.user!.id,
+        preparedAt: new Date(),
+      }], { session });
+      const nextRevision = revision[0];
+      if (!nextRevision) throw new Error("Failed to create proposal revision");
+      proposal.currentRevisionId = nextRevision._id;
+      proposal.currentRevisionNumber = (proposal.currentRevisionNumber ?? 0) + 1;
+      proposal.status = "Negotiation";
+      await proposal.save({ session });
 
-    if (!snapshot.exists()) {
-      res.status(404).json({ success: false, message: "Proposal not found" });
-      return;
-    }
+      const occurredAt = new Date();
+      await NegotiationEvent.create([{
+        proposalId: proposal._id,
+        leadId: lead._id,
+        revisionId: nextRevision._id,
+        type: "Negotiation",
+        fromStatus: previousStatus,
+        toStatus: "Negotiation",
+        occurredAt,
+        actorId: req.user!.id,
+        note: revisionData.notes ?? revisionData.reason ?? `Revision ${nextRevision.revisionNumber} saved`,
+      }], { session });
 
-    const proposal = snapshot.val() as IProposal;
+      if (lead.status !== "Negotiation") {
+        const previousStage = lead.status;
+        lead.status = "Negotiation";
+        lead.lastMeaningfulActivityAt = occurredAt;
+        lead.nextReminderDueAt = await getNextLeadReminderAt("Negotiation", occurredAt);
+        await lead.save({ session });
+        await AuditEvent.create([{
+          entityType: "lead",
+          entityId: lead._id,
+          leadId: lead._id,
+          eventType: "lead.stage_changed",
+          actorId: req.user!.id,
+          occurredAt,
+          meaningfulActivity: true,
+          changes: [{ field: "status", before: previousStage, after: "Negotiation" }],
+          note: "Lead moved to Negotiation on proposal revision",
+        }], { session });
+      }
+    });
+    res.status(200).json({ success: true, message: "Proposal revision saved", data: await proposalResponse(id) });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Proposal update failed";
+    const status = message === "Proposal not found" ? 404 : message === "Not authorized" ? 403 : 400;
+    res.status(status).json({ success: false, message });
+  } finally {
+    await session.endSession();
+  }
+};
 
-    if (proposal.createdBy !== req.user.id && !canAccessAllProposals(req.user?.role)) {
-      res.status(403).json({ success: false, message: "Not authorized to update this proposal" });
-      return;
-    }
+export const sendProposal = async (req: AuthRequest, res: Response): Promise<void> => {
+  const id = String(req.params.id ?? "");
+  if (!validId(id)) {
+    res.status(400).json({ success: false, message: "Invalid proposal ID" });
+    return;
+  }
+  const session = await mongoose.startSession();
+  try {
+    await session.withTransaction(async () => {
+      const proposal = await Proposal.findById(id).session(session);
+      if (!proposal) throw new Error("Proposal not found");
+      if (!(await canAccessLead(req.user!, proposal.leadId.toString()))) throw new Error("Not authorized");
+      const lead = await Lead.findById(proposal.leadId).session(session);
+      if (!lead || lead.outcome !== "open") throw new Error("Proposal can only be sent for an open lead");
+      const allowedSend = ["Proposal Sent", "Negotiation"].includes(lead.status) || req.body?.moveToProposalStage === true;
+      if (!allowedSend) {
+        throw new Error("Cannot send proposal unless the lead is in Proposal Sent or Negotiation stage. Save as draft first.");
+      }
+      if (!proposal.currentRevisionId) throw new Error("Save a proposal revision before sending");
 
-    const updates = { ...req.body, updatedAt: Date.now() };
-    delete updates.createdBy;
-    delete updates.lead;
-    if (Object.prototype.hasOwnProperty.call(updates, "testingScope")) {
-      updates.testingScope = normalizeTestingScope(updates.testingScope);
-    }
+      const existingSend = await NegotiationEvent.exists({
+        proposalId: proposal._id,
+        revisionId: proposal.currentRevisionId,
+        type: { $in: ["Proposal Sent", "sent", "proposal_sent"] },
+      }).session(session);
+      if (existingSend) throw new Error("The current revision has already been sent");
 
-    await propRef.update(updates);
+      const previousStatus = proposal.status;
+      proposal.status = "Proposal Sent";
+      await proposal.save({ session });
+      await NegotiationEvent.create([{
+        proposalId: proposal._id,
+        leadId: lead._id,
+        revisionId: proposal.currentRevisionId,
+        type: "Proposal Sent",
+        fromStatus: previousStatus,
+        toStatus: "Proposal Sent",
+        actorId: req.user!.id,
+        occurredAt: new Date(),
+        note: typeof req.body.note === "string" ? req.body.note.trim() : undefined,
+      }], { session });
 
-    if (updates.status) {
-        const statusMap: Record<string, string> = {
-          Accepted: "Won",
-          Rejected: "Lost",
-          "In Negotiation": "Negotiation",
-          Sent: "Proposal Sent",
-        };
-        const newLeadStatus = statusMap[updates.status];
-        if (newLeadStatus) {
-            const leadRef = rtdb.ref(`${LEADS_PATH}/${proposal.lead}`);
-            const leadSnap = await leadRef.once("value");
-            const leadData = leadSnap.val() as ILead;
+      const previousStage = lead.status;
+      const stageChanged = lead.status !== "Negotiation" && lead.status !== "Proposal Sent";
+      if (stageChanged) {
+        lead.status = "Proposal Sent";
+      }
+      const sentAt = new Date();
+      lead.lastMeaningfulActivityAt = sentAt;
+      lead.nextReminderDueAt = await getNextLeadReminderAt(lead.status, sentAt);
+      await lead.save({ session });
+      await AuditEvent.create([{
+        entityType: "lead",
+        entityId: lead._id,
+        leadId: lead._id,
+        eventType: stageChanged ? "lead.stage_changed" : "lead.proposal_sent",
+        actorId: req.user!.id,
+        occurredAt: sentAt,
+        meaningfulActivity: true,
+        changes: stageChanged ? [{ field: "status", before: previousStage, after: "Proposal Sent" }] : [],
+        note: "Proposal sent",
+      }], { session });
+    });
+    res.status(200).json({ success: true, message: "Proposal sent", data: await proposalResponse(id) });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Proposal send failed";
+    const status = message === "Proposal not found" ? 404 : message === "Not authorized" ? 403 : 409;
+    res.status(status).json({ success: false, message });
+  } finally {
+    await session.endSession();
+  }
+};
 
-            if (leadData && leadData.status !== newLeadStatus) {
-                const timeline = [...(leadData.timeline || [])];
-                const now = Date.now();
-                if (newLeadStatus === "Won" || newLeadStatus === "Lost") {
-                    const stageAtClosure = getLeadStage(leadData);
-                    const outcome: LeadOutcome = newLeadStatus === "Won" ? "won" : "lost";
-                    timeline.push({
-                        event: newLeadStatus,
-                        status: stageAtClosure,
-                        previousStatus: stageAtClosure,
-                        outcome,
-                        remark: `Lead marked ${outcome} at ${stageAtClosure} via Proposal update`,
-                        performedBy: req.user.id,
-                        timestamp: now
-                    });
-                    await leadRef.update({
-                        status: stageAtClosure,
-                        outcome,
-                        wonAtStatus: outcome === "won" ? stageAtClosure : null,
-                        lostAtStatus: outcome === "lost" ? stageAtClosure : null,
-                        closedAt: now,
-                        wasEverWon: outcome === "won" ? true : leadData.wasEverWon || false,
-                        timeline,
-                        updatedAt: now
-                    });
-                } else {
-                    timeline.push({
-                        event: "Status Changed",
-                        status: newLeadStatus as LeadStatus,
-                        previousStatus: getLeadStage(leadData),
-                        outcome: "open",
-                        remark: `Status updated to ${newLeadStatus} via Proposal update`,
-                        performedBy: req.user.id,
-                        timestamp: now
-                    });
-                    await leadRef.update({
-                        status: newLeadStatus,
-                        outcome: "open",
-                        timeline,
-                        updatedAt: now
-                    });
-                }
-            }
+export const updateProposalDecision = async (req: AuthRequest, res: Response): Promise<void> => {
+  const id = String(req.params.id ?? "");
+  const nextStatusRaw: string = String(req.body.status ?? "").trim();
+  // Normalize status to the 5 stages: Draft, Proposal Sent, Negotiation, Won, Lost
+  const nextStatus =
+    nextStatusRaw === "Won" || nextStatusRaw === "Accepted"
+      ? "Won"
+      : nextStatusRaw === "Lost" || nextStatusRaw === "Rejected" || nextStatusRaw === "Declined"
+      ? "Lost"
+      : nextStatusRaw === "Negotiation" || nextStatusRaw === "Revision" || nextStatusRaw === "In Negotiation"
+      ? "Negotiation"
+      : nextStatusRaw;
+
+  if (!validId(id) || !["Negotiation", "Won", "Lost"].includes(nextStatus)) {
+    res.status(400).json({ success: false, message: "A valid proposal ID and a decision status (Negotiation, Won, or Lost) are required" });
+    return;
+  }
+  const session = await mongoose.startSession();
+  try {
+    await session.withTransaction(async () => {
+      const proposal = await Proposal.findById(id).session(session);
+      if (!proposal) throw new Error("Proposal not found");
+      if (!(await canAccessLead(req.user!, proposal.leadId.toString()))) throw new Error("Not authorized");
+      const lead = await Lead.findById(proposal.leadId).session(session);
+      if (!lead || lead.outcome !== "open") throw new Error("Lead is not open");
+      if (!["Proposal Sent", "Negotiation", "Sent", "In Negotiation", "Revision"].includes(proposal.status)) {
+        throw new Error("A proposal must be sent before its customer decision can be recorded");
+      }
+      if (nextStatus === "Lost" && req.body.finalDecision === true && !String(req.body.reason ?? "").trim()) {
+        throw new Error("A reason is required for a final rejection");
+      }
+
+      const previousStatus = proposal.status;
+      const decisionAt = new Date();
+      proposal.status = nextStatus as "Negotiation" | "Won" | "Lost";
+      await proposal.save({ session });
+      await NegotiationEvent.create([{
+        proposalId: proposal._id,
+        leadId: lead._id,
+        ...(proposal.currentRevisionId ? { revisionId: proposal.currentRevisionId } : {}),
+        type: nextStatus,
+        fromStatus: previousStatus,
+        toStatus: nextStatus,
+        ...(typeof req.body.customerMessage === "string" ? { customerMessage: req.body.customerMessage.trim() } : {}),
+        actorId: req.user!.id,
+        occurredAt: decisionAt,
+        ...(typeof req.body.note === "string" ? { note: req.body.note.trim() } : {}),
+      }], { session });
+
+      if (nextStatus === "Won" || (nextStatus === "Lost" && req.body.finalDecision === true)) {
+        const outcome = nextStatus === "Won" ? "won" : "lost";
+        const stage = lead.status;
+        lead.outcome = outcome;
+        lead.closedAt = decisionAt;
+        lead.lastMeaningfulActivityAt = decisionAt;
+        lead.nextReminderDueAt = null;
+        if (outcome === "won") {
+          lead.wonAtStatus = stage;
+          lead.wasEverWon = true;
+          if (req.body.reason) lead.wonReason = String(req.body.reason).trim();
+        } else {
+          lead.lostAtStatus = stage;
+          lead.lostReason = String(req.body.reason).trim();
         }
-    }
-
-    res.status(200).json({ success: true, message: "Proposal updated successfully" });
-  } catch (error: any) {
-    res.status(400).json({ success: false, message: error.message });
+        await lead.save({ session });
+        await AuditEvent.create([{
+          entityType: "lead",
+          entityId: lead._id,
+          leadId: lead._id,
+          eventType: `lead.${outcome}`,
+          actorId: req.user!.id,
+          occurredAt: decisionAt,
+          meaningfulActivity: true,
+          changes: [{ field: "outcome", before: "open", after: outcome }],
+          ...(typeof req.body.reason === "string" ? { reason: req.body.reason.trim() } : {}),
+        }], { session });
+      } else if (lead.status !== "Negotiation") {
+        const previousStage = lead.status;
+        lead.status = "Negotiation";
+        lead.lastMeaningfulActivityAt = decisionAt;
+        lead.nextReminderDueAt = await getNextLeadReminderAt("Negotiation", decisionAt);
+        await lead.save({ session });
+        await AuditEvent.create([{
+          entityType: "lead",
+          entityId: lead._id,
+          leadId: lead._id,
+          eventType: "lead.stage_changed",
+          actorId: req.user!.id,
+          occurredAt: decisionAt,
+          meaningfulActivity: true,
+          changes: [{ field: "status", before: previousStage, after: "Negotiation" }],
+          note: "Proposal entered revision/negotiation",
+        }], { session });
+      }
+    });
+    res.status(200).json({ success: true, message: "Proposal decision recorded", data: await proposalResponse(id) });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Proposal decision failed";
+    const status = message === "Proposal not found" ? 404 : message === "Not authorized" ? 403 : 400;
+    res.status(status).json({ success: false, message });
+  } finally {
+    await session.endSession();
   }
 };
 
-// @desc    Delete proposal
-export const deleteProposal = async (req: AuthRequest, res: Response) => {
-  try {
-    const id = req.params.id as string;
-    const propRef = rtdb.ref(`${PROPOSALS_PATH}/${id}`);
-    const snapshot = await propRef.once("value");
-
-    if (!snapshot.exists()) {
-      res.status(404).json({ success: false, message: "Proposal not found" });
-      return;
-    }
-
-    const proposal = snapshot.val() as IProposal;
-    if (proposal.createdBy !== req.user.id && !canAccessAllProposals(req.user?.role)) {
-      res.status(403).json({ success: false, message: "Not authorized to delete this proposal" });
-      return;
-    }
-
-    await propRef.remove();
-    res.status(200).json({ success: true, message: "Proposal removed" });
-  } catch (error: any) {
-    res.status(500).json({ success: false, message: error.message });
-  }
+export const deleteProposal = async (_req: AuthRequest, res: Response): Promise<void> => {
+  res.status(409).json({
+    success: false,
+    message: "Proposal history cannot be deleted. An approved audited withdrawal action is required.",
+  });
 };

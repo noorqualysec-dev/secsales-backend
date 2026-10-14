@@ -14,7 +14,13 @@
 // }
 
 // export const MEETING_STATUSES = ["Scheduled", "Completed", "Cancelled"] as const;
-export type MeetingStatus = "Scheduled" | "Completed" | "Cancelled";
+export type MeetingStatus =
+  | "Scheduled"
+  | "Pending"
+  | "In Progress"
+  | "Completed"
+  | "On Hold"
+  | "Cancelled";
 export type MeetingMode = "google_meet" | "zoom" | "phone" | "in_person" | "other";
 export type MeetingSyncStatus = "pending" | "success" | "failed";
 export type MeetingAttendeeType = "sales_rep" | "lead" | "external";
@@ -63,7 +69,10 @@ export interface IMeeting {
 
 export const MEETING_STATUSES = [
   "Scheduled",
+  "Pending",
+  "In Progress",
   "Completed",
+  "On Hold",
   "Cancelled",
 ] as const;
 

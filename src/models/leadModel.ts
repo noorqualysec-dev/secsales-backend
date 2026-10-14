@@ -1,7 +1,7 @@
 export interface ITimelineEvent {
-    event: "Creation" | "Status Changed" | "Remark Added" | "Assigned" | "Won" | "Lost" | "Cancelled" | "Reopened";
+    event: "Creation" | "Status Changed" | "Remark Added" | "Assigned" | "Won" | "Lost" | "Cancelled" | "Reopened" | "Meeting Scheduled" | "Task Created";
     status?: LeadStatus;
-     previousStatus?: LeadStatus;
+    previousStatus?: LeadStatus;
     outcome?: LeadOutcome;
     remark?: string;
     reason?: string;
@@ -98,7 +98,7 @@ export interface ILead {
     lastActivityAt?: number;          // Last meaningful action on lead
 lastReminderAt?: number | null;         // Last time reminder was sent
 followUpReminderCount?: number;   // How many reminders sent
-    nextReminderDueAt?: number;       // Optional: precomputed next reminder time
+    nextReminderDueAt?: number | null;       // Optional: precomputed next reminder time
 
     companyInsights?: {
         hiringSignal?: string;

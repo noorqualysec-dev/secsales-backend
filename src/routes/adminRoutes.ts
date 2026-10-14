@@ -2,6 +2,7 @@ import express from "express";
 import { protect, authorize } from "../middleware/authMiddleware.js";
 import {
     getAllUsers,
+    provisionUser,
     updateUserRole,
     toggleUserStatus,
     getAllLeads,
@@ -23,6 +24,7 @@ router.use(protect, authorize("admin" , "manager"));
 
 // ── User management ──────────────────────────────────────────────────────────
 router.get("/users", getAllUsers);
+router.post("/users", provisionUser);
 router.put("/users/:id/role", updateUserRole);
 router.put("/users/:id/status", toggleUserStatus);
 

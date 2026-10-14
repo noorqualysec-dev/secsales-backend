@@ -1,10 +1,18 @@
 import app from "./server.js";
+import connectDB from "./config/db.js";
+import { startLeadFollowUpCron } from "./jobs/leadFollowUpCron.js";
 
 const PORT = Number(process.env.PORT || 8002);
-console.log("Starting backend...");
-console.log("PORT =", PORT);
-console.log("FRONTEND_URL =", process.env.FRONTEND_URL);
-console.log("GOOGLE_REDIRECT_URI =", process.env.GOOGLE_REDIRECT_URI);
-app.listen(PORT, () => {
-  console.log(`Backend running on http://localhost:${PORT}`);
-});
+
+try {
+  await connectDB();
+  if (process.env.NODE_ENV !== "production") {
+    startLeadFollowUpCron();
+  }
+  app.listen(PORT, () => {
+    console.log(`Backend running on http://localhost:${PORT}`);
+  });
+} catch (error) {
+  console.error("Backend startup failed:", error);
+  process.exitCode = 1;
+}

@@ -1,7 +1,7 @@
 import XLSX from "xlsx";
 import type { ExcelLeadRow } from "../imports/leadImport.types.js";
 import { mapExcelRowToLead } from "../imports/leadImport.mapper.js";
-import { rtdb } from "../config/firebase.js"; // adjust path if your firebase export path is different
+import { mongoStore } from "../config/mongoCompat.js";
 import type { ILead } from "../models/leadModel.js";
 
 const LEADS_PATH = "leads";
@@ -95,7 +95,7 @@ async function getAssignableUsersLookup(): Promise<AssignableUserLookup> {
     const byEmail = new Map<string, ImportUser>();
     const byName = new Map<string, ImportUser[]>();
 
-    const snapshot = await rtdb.ref(USERS_PATH).once("value");
+    const snapshot = await mongoStore.ref(USERS_PATH).once("value");
     if (!snapshot.exists()) {
         return { byEmail, byName };
     }
@@ -178,7 +178,7 @@ function resolveAssigneeForRow(
 }
 
 async function getExistingLeadEmails(): Promise<Set<string>> {
-    const snapshot = await rtdb.ref(LEADS_PATH).once("value");
+    const snapshot = await mongoStore.ref(LEADS_PATH).once("value");
     const existingEmails = new Set<string>();
 
     if (!snapshot.exists()) return existingEmails;
@@ -263,7 +263,7 @@ export async function importLeadsFromExcelBuffer(
     }
 
     for (const lead of validLeads) {
-        await rtdb.ref(LEADS_PATH).push(lead);
+        await mongoStore.ref(LEADS_PATH).push(lead);
     }
 
     return {

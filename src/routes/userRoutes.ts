@@ -1,14 +1,13 @@
 import express from "express";
-import { createUser, signInUser, deleteUser, updateUser } from "../controllers/userController.js";
+import { signInUser, deleteUser, updateUser } from "../controllers/userController.js";
 import { protect } from "../middleware/authMiddleware.js";
 
 const router = express.Router();
 
-// Register and Login (public)
-router.post("/", createUser);
+// Public self-registration is disabled. Users are provisioned by an operator
+// and subsequently managed through protected administrator operations.
 router.post("/login", signInUser);
 
-// User self-management (protected)
 router.delete("/:id", protect, deleteUser);
 router.put("/:id", protect, updateUser);
 

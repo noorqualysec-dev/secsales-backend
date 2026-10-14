@@ -29,9 +29,10 @@ import { runLeadFollowUpReminderJob } from "../controllers/cronController.js";
 const router = express.Router();
 
 router.get("/lead-followup-reminders", (req, res) => {
-  const key = req.query.key;
+  const secret = process.env.CRON_SECRET;
+  const key = req.get("x-cron-secret") ?? req.query.key;
 
-  if (key !== process.env.CRON_SECRET) {
+  if (!secret || typeof key !== "string" || key !== secret) {
     return res.status(401).json({
       success: false,
       message: "Unauthorized cron request",
