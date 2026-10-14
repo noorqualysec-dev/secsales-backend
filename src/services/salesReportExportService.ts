@@ -1,5 +1,5 @@
 import XLSX from "xlsx";
-import { mongoStore } from "../config/mongoCompat.js";
+import { rtdb } from "../config/firebase.js";
 import { LEAD_STATUSES, normalizeLeadStatus } from "../models/leadModel.js";
 
 const USERS_PATH = "users";
@@ -510,9 +510,9 @@ function appendSheetFromRows(
 
 async function loadReportData(): Promise<LoadedReportData> {
     const [usersSnapshot, leadsSnapshot, proposalsSnapshot] = await Promise.all([
-        mongoStore.ref(USERS_PATH).once("value"),
-        mongoStore.ref(LEADS_PATH).once("value"),
-        mongoStore.ref(PROPOSALS_PATH).once("value"),
+        rtdb.ref(USERS_PATH).once("value"),
+        rtdb.ref(LEADS_PATH).once("value"),
+        rtdb.ref(PROPOSALS_PATH).once("value"),
     ]);
 
     const usersRaw = (usersSnapshot.val() || {}) as Record<string, Record<string, unknown>>;

@@ -18,11 +18,9 @@
 export type TaskStatus =
   | "Pending"
   | "In Progress"
-  | "Completed"
   | "Waiting on someone"
-  | "On Hold"
-  | "Cancelled"
-  | "Deferred";
+  | "Deferred"
+  | "Completed";
 
 export type TaskPriority = "Low" | "Medium" | "High";
 
@@ -59,11 +57,9 @@ export interface ITask {
 export const TASK_STATUSES = [
   "Pending",
   "In Progress",
-  "Completed",
   "Waiting on someone",
-  "On Hold",
-  "Cancelled",
   "Deferred",
+  "Completed",
 ] as const;
 
 export const TASK_PRIORITIES = ["Low", "Medium", "High"] as const;

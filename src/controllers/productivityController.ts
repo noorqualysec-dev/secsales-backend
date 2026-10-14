@@ -1,14 +1,12 @@
 import type { Response } from "express";
-import { Types } from "mongoose";
 import type { AuthRequest } from "../middleware/authMiddleware.js";
-import { mongoStore } from "../config/mongoCompat.js";
+import { rtdb } from "../config/firebase.js";
 import { MeetingGoogleSyncService } from "../services/meetingGoogleSyncService.js";
-import {
-    MEETING_STATUSES,
-    type IMeeting,
-    type IMeetingAttendee,
-    type MeetingMode,
-    type MeetingStatus,
+import type {
+    IMeeting,
+    IMeetingAttendee,
+    MeetingMode,
+    MeetingStatus,
 } from "../models/meetingModel.js";
 import { TASK_PRIORITIES, TASK_STATUSES, type ITask, type TaskSource } from "../models/taskModel.js";
 
@@ -17,7 +15,7 @@ const TASKS_PATH = "tasks";
 const MEETINGS_PATH = "meetings";
 const USER_ROLES_WITH_GLOBAL_MEETING_ACCESS = new Set(["admin", "manager"]);
 const USER_ROLES_WITH_GLOBAL_TASK_ACCESS = new Set(["admin", "manager"]);
-const ALLOWED_MEETING_STATUSES = new Set<string>(MEETING_STATUSES);
+const ALLOWED_MEETING_STATUSES = new Set<MeetingStatus>(["Scheduled", "Completed", "Cancelled"]);
 const ALLOWED_MEETING_MODES = new Set<MeetingMode>(["google_meet", "zoom", "phone", "in_person", "other"]);
 const ALLOWED_TASK_STATUSES = new Set<string>(TASK_STATUSES);
 const ALLOWED_TASK_PRIORITIES = new Set<string>(TASK_PRIORITIES);
@@ -35,31 +33,9 @@ const getLeadOutcome = (lead: any): "open" | "won" | "lost" | "cancelled" => {
 
 const getLeadClosedAt = (lead: any): number => Number(lead?.closedAt || lead?.closingDate || lead?.updatedAt || 0);
 
-const canUserAccessLead = (lead: any, user: any): boolean => {
-    if (!user || !lead) return false;
-    if (USER_ROLES_WITH_GLOBAL_TASK_ACCESS.has(user.role)) return true;
-
-    const userIds = new Set(
-        [user?.id, user?._id, user?.uid, user?.legacyUid]
-            .map((v) => String(v ?? "").trim())
-            .filter((v) => v.length > 0)
-    );
-    if (!userIds.size) return false;
-
-    const assignedTo = String(lead?.assignedTo?._id ?? lead?.assignedTo?.id ?? lead?.assignedTo ?? "").trim();
-    const createdBy = String(lead?.createdBy?._id ?? lead?.createdBy?.id ?? lead?.createdBy ?? "").trim();
-
-    if (assignedTo && userIds.has(assignedTo)) return true;
-    if (createdBy && userIds.has(createdBy)) return true;
-    return false;
-};
-
-const canAccessMeeting = (user: AuthRequest["user"], meeting: any, lead?: any): boolean => {
+const canAccessMeeting = (user: AuthRequest["user"], meeting: any): boolean => {
     if (!user) return false;
-    if (USER_ROLES_WITH_GLOBAL_MEETING_ACCESS.has(user.role)) return true;
-    if (meeting.assignedTo === user.id || meeting.createdBy === user.id) return true;
-    if (lead && canUserAccessLead(lead, user)) return true;
-    return false;
+    return USER_ROLES_WITH_GLOBAL_MEETING_ACCESS.has(user.role) || meeting.assignedTo === user.id;
 };
 
 const normalizeTaskAssigneeIds = (assignedTo: unknown): string[] => {
@@ -78,33 +54,14 @@ const normalizeTaskAssigneeIds = (assignedTo: unknown): string[] => {
 const taskHasAssignee = (task: any, userId: string): boolean =>
     normalizeTaskAssigneeIds(task?.assignedTo).includes(userId);
 
-const canAccessTask = (user: AuthRequest["user"], task: any, lead?: any): boolean => {
+const canAccessTask = (user: AuthRequest["user"], task: any): boolean => {
     if (!user) return false;
-    if (USER_ROLES_WITH_GLOBAL_TASK_ACCESS.has(user.role)) return true;
-    if (taskHasAssignee(task, user.id) || task.createdBy === user.id) return true;
-    if (lead && canUserAccessLead(lead, user)) return true;
-    return false;
+    return USER_ROLES_WITH_GLOBAL_TASK_ACCESS.has(user.role) || taskHasAssignee(task, user.id) || task.createdBy === user.id;
 };
 
-const canDeleteTask = (user: AuthRequest["user"], task: any, lead?: any): boolean => {
+const canDeleteTask = (user: AuthRequest["user"], task: any): boolean => {
     if (!user) return false;
-    if (USER_ROLES_WITH_GLOBAL_TASK_ACCESS.has(user.role)) return true;
-    if (task.createdBy === user.id) return true;
-    if (lead && canUserAccessLead(lead, user)) return true;
-    return false;
-};
-
-const handleControllerError = (res: Response, error: any, defaultMessage: string) => {
-    console.error(`${defaultMessage}:`, error);
-    if (error?.name === "ValidationError") {
-        const firstMessage = Object.values(error.errors || {})[0] as any;
-        const msg = firstMessage?.message || error.message || "Validation failed";
-        return res.status(400).json({ success: false, message: msg });
-    }
-    if (error?.name === "CastError") {
-        return res.status(400).json({ success: false, message: `Invalid identifier: ${error.path || "field"}` });
-    }
-    return res.status(500).json({ success: false, message: defaultMessage });
+    return USER_ROLES_WITH_GLOBAL_TASK_ACCESS.has(user.role) || task.createdBy === user.id;
 };
 
 const normalizeAttendees = (attendees: unknown): IMeetingAttendee[] => {
@@ -141,41 +98,28 @@ const attachDefaultMeetingAttendees = (
     const attendeeMap = new Map<string, IMeetingAttendee>();
 
     for (const attendee of attendees) {
-        if (!attendee || typeof attendee !== "object") continue;
-        const rawEmail = String(attendee.email || "").trim().toLowerCase();
-        if (!rawEmail) continue;
-
-        const normalizedAttendee: IMeetingAttendee = {
-            email: rawEmail,
-            type: attendee.type || "external",
-            responseStatus: attendee.responseStatus || "needsAction",
-        };
-        const name = attendee.name?.trim();
-        if (name) normalizedAttendee.name = name;
-        attendeeMap.set(rawEmail, normalizedAttendee);
+        attendeeMap.set(attendee.email.toLowerCase(), attendee);
     }
 
-    if (lead?.email && typeof lead.email === "string" && lead.email.trim()) {
-        const leadEmail = lead.email.trim().toLowerCase();
+    if (lead?.email) {
         const leadAttendee: IMeetingAttendee = {
-            email: leadEmail,
+            email: lead.email,
             type: "lead",
-            responseStatus: attendeeMap.get(leadEmail)?.responseStatus || "needsAction",
+            responseStatus: attendeeMap.get(String(lead.email).toLowerCase())?.responseStatus || "needsAction",
         };
         const leadName = `${lead.firstName || ""} ${lead.lastName || ""}`.trim();
         if (leadName) leadAttendee.name = leadName;
-        attendeeMap.set(leadEmail, leadAttendee);
+        attendeeMap.set(String(lead.email).toLowerCase(), leadAttendee);
     }
 
-    if (user?.email && typeof user.email === "string" && user.email.trim()) {
-        const userEmail = user.email.trim().toLowerCase();
+    if (user?.email) {
         const salesRepAttendee: IMeetingAttendee = {
-            email: userEmail,
+            email: user.email,
             type: "sales_rep",
-            responseStatus: attendeeMap.get(userEmail)?.responseStatus || "accepted",
+            responseStatus: attendeeMap.get(String(user.email).toLowerCase())?.responseStatus || "accepted",
         };
         if (user.name) salesRepAttendee.name = user.name;
-        attendeeMap.set(userEmail, salesRepAttendee);
+        attendeeMap.set(String(user.email).toLowerCase(), salesRepAttendee);
     }
 
     return Array.from(attendeeMap.values());
@@ -190,7 +134,7 @@ const buildMeetingResponse = (meeting: any, leads: Record<string, any>) => {
         startTime: getMeetingStartTime(meeting),
         endTime: getMeetingEndTime(meeting),
         leadName: lead ? `${lead.firstName} ${lead.lastName}`.trim() : undefined,
-        company: lead?.company || (meeting.leadId ? "Individual" : undefined),
+        company: lead?.company || "Individual",
         lead: lead
             ? {
                 id: meeting.leadId,
@@ -204,15 +148,6 @@ const buildMeetingResponse = (meeting: any, leads: Record<string, any>) => {
     };
 };
 
-const parsePayloadTime = (val: any): number | undefined => {
-    if (val === undefined || val === null || val === "") return undefined;
-    if (typeof val === "number" && Number.isFinite(val) && val > 0) return val;
-    const num = Number(val);
-    if (Number.isFinite(num) && num > 0) return num;
-    const parsed = new Date(val).getTime();
-    return Number.isFinite(parsed) && parsed > 0 ? parsed : undefined;
-};
-
 const parseMeetingPayload = (body: any, isPartial = false): { data: Partial<IMeeting>; error?: string } => {
     const updates: Partial<IMeeting> = {};
 
@@ -222,24 +157,21 @@ const parseMeetingPayload = (body: any, isPartial = false): { data: Partial<IMee
         updates.subject = subject;
     }
 
-    if (body.leadId !== undefined && body.leadId !== null) {
-        const leadId = String(body.leadId).trim();
-        if (leadId && leadId !== "null" && leadId !== "undefined" && leadId !== "none") {
-            updates.leadId = leadId;
-        } else {
-            updates.leadId = "";
-        }
+    if (!isPartial || body.leadId !== undefined) {
+        const leadId = String(body.leadId || "").trim();
+        if (!leadId) return { data: {}, error: "Lead ID is required" };
+        updates.leadId = leadId;
     }
 
     if (!isPartial || body.startTime !== undefined || body.from !== undefined) {
-        const startTime = parsePayloadTime(body.startTime ?? body.from);
-        if (!startTime) return { data: {}, error: "Valid meeting start time is required" };
+        const startTime = Number(body.startTime ?? body.from);
+        if (!Number.isFinite(startTime)) return { data: {}, error: "Valid meeting start time is required" };
         updates.startTime = startTime;
     }
 
     if (!isPartial || body.endTime !== undefined || body.to !== undefined) {
-        const endTime = parsePayloadTime(body.endTime ?? body.to);
-        if (!endTime) return { data: {}, error: "Valid meeting end time is required" };
+        const endTime = Number(body.endTime ?? body.to);
+        if (!Number.isFinite(endTime)) return { data: {}, error: "Valid meeting end time is required" };
         updates.endTime = endTime;
     }
 
@@ -272,13 +204,6 @@ const parseMeetingPayload = (body: any, isPartial = false): { data: Partial<IMee
             return { data: {}, error: "Invalid meeting mode" };
         }
         updates.meetingMode = body.meetingMode;
-    } else if (body.createGoogleMeeting === true || body.createGoogleMeet === true || body.isGoogleMeet === true) {
-        updates.meetingMode = "google_meet";
-    }
-
-    if (body.meetLink !== undefined) {
-        const meetLink = String(body.meetLink || "").trim();
-        if (meetLink) updates.meetLink = meetLink;
     }
 
     if (body.attendees !== undefined) {
@@ -289,12 +214,12 @@ const parseMeetingPayload = (body: any, isPartial = false): { data: Partial<IMee
 };
 
 const fetchLeadById = async (leadId: string) => {
-    const leadSnapshot = await mongoStore.ref(`${LEADS_PATH}/${leadId}`).once("value");
+    const leadSnapshot = await rtdb.ref(`${LEADS_PATH}/${leadId}`).once("value");
     return leadSnapshot.val();
 };
 
 const fetchUserById = async (userId: string) => {
-    const userSnapshot = await mongoStore.ref(`users/${userId}`).once("value");
+    const userSnapshot = await rtdb.ref(`users/${userId}`).once("value");
     return userSnapshot.val();
 };
 
@@ -346,45 +271,35 @@ const buildTaskResponse = (
 };
 
 const fetchMeetingWithLead = async (meetingId: string) => {
-    const meetingSnapshot = await mongoStore.ref(`${MEETINGS_PATH}/${meetingId}`).once("value");
+    const meetingSnapshot = await rtdb.ref(`${MEETINGS_PATH}/${meetingId}`).once("value");
     const meeting = meetingSnapshot.val();
     if (!meeting) return null;
 
-    const leadsSnapshot = await mongoStore.ref(LEADS_PATH).once("value");
+    const leadsSnapshot = await rtdb.ref(LEADS_PATH).once("value");
     const leads = leadsSnapshot.val() || {};
 
     return buildMeetingResponse({ ...meeting, id: meetingSnapshot.key }, leads);
 };
 
-const addLeadTimelineEntry = async (
-    leadId: string,
-    remark: string,
-    performedBy: string,
-    event: string = "Meeting Scheduled"
-) => {
-    try {
-        if (!Types.ObjectId.isValid(leadId)) return;
-        const leadRef = mongoStore.ref(`${LEADS_PATH}/${leadId}`);
-        const leadSnapshot = await leadRef.once("value");
-        const lead = leadSnapshot.val();
+const addLeadTimelineEntry = async (leadId: string, remark: string, performedBy: string) => {
+    const leadRef = rtdb.ref(`${LEADS_PATH}/${leadId}`);
+    const leadSnapshot = await leadRef.once("value");
+    const lead = leadSnapshot.val();
 
-        if (!lead) return;
+    if (!lead) return;
 
-        const timeline = Array.isArray(lead.timeline) ? lead.timeline : [];
-        timeline.push({
-            event,
-            remark,
-            performedBy,
-            timestamp: Date.now(),
-        });
+    const timeline = Array.isArray(lead.timeline) ? lead.timeline : [];
+    timeline.push({
+        event: "Status Changed",
+        remark,
+        performedBy,
+        timestamp: Date.now(),
+    });
 
-        await leadRef.update({ timeline, updatedAt: Date.now() });
-    } catch (timelineErr) {
-        console.error("Failed to append timeline entry to lead:", timelineErr);
-    }
+    await leadRef.update({ timeline, updatedAt: Date.now() });
 };
 
-const GLOBAL_TASK_ASSIGNABLE_ROLES = new Set(["admin", "sales_rep", "manager"]);
+const GLOBAL_TASK_ASSIGNABLE_ROLES = new Set(["sales_rep", "manager"]);
 
 const resolveTaskSource = (creatorRole: string, createdBy: string, assignedTo: string[]): TaskSource => {
     const assigneeIds = normalizeTaskAssigneeIds(assignedTo);
@@ -401,9 +316,9 @@ export const getSalesSummary = async (req: AuthRequest, res: Response) => {
         const filterEnd = endDate ? Number(endDate) : 9999999999999;
 
         const [leadsSnap, tasksSnap, meetingsSnap] = await Promise.all([
-            mongoStore.ref(LEADS_PATH).once("value"),
-            mongoStore.ref(TASKS_PATH).once("value"),
-            mongoStore.ref(MEETINGS_PATH).once("value"),
+            rtdb.ref(LEADS_PATH).once("value"),
+            rtdb.ref(TASKS_PATH).once("value"),
+            rtdb.ref(MEETINGS_PATH).once("value"),
         ]);
 
         const leads = leadsSnap.val() || {};
@@ -479,19 +394,15 @@ export const getSalesSummary = async (req: AuthRequest, res: Response) => {
 export const getMeetings = async (req: AuthRequest, res: Response) => {
     try {
         const { status, leadId, startDate, endDate, assignedTo } = req.query as Record<string, string | undefined>;
-        const meetingsSnapshot = await mongoStore.ref(MEETINGS_PATH).once("value");
-        const leadsSnapshot = await mongoStore.ref(LEADS_PATH).once("value");
+        const meetingsSnapshot = await rtdb.ref(MEETINGS_PATH).once("value");
+        const leadsSnapshot = await rtdb.ref(LEADS_PATH).once("value");
         const meetings = meetingsSnapshot.val() || {};
         const leads = leadsSnapshot.val() || {};
 
         let items = Object.entries(meetings).map(([id, meeting]: [string, any]) => ({ ...meeting, id }));
 
         if (!USER_ROLES_WITH_GLOBAL_MEETING_ACCESS.has(req.user!.role)) {
-            items = items.filter((meeting: any) => {
-                if (meeting.assignedTo === req.user!.id || meeting.createdBy === req.user!.id) return true;
-                if (meeting.leadId && leads[meeting.leadId] && canUserAccessLead(leads[meeting.leadId], req.user)) return true;
-                return false;
-            });
+            items = items.filter((meeting: any) => meeting.assignedTo === req.user!.id);
         } else if (assignedTo) {
             items = items.filter((meeting: any) => meeting.assignedTo === assignedTo);
         }
@@ -507,7 +418,7 @@ export const getMeetings = async (req: AuthRequest, res: Response) => {
 
         res.status(200).json({ success: true, count: data.length, data });
     } catch (error: any) {
-        handleControllerError(res, error, "Failed to fetch meetings");
+        res.status(500).json({ success: false, message: error.message });
     }
 };
 
@@ -515,9 +426,9 @@ export const getTasks = async (req: AuthRequest, res: Response) => {
     try {
         const { status, priority, leadId, assignedTo, search } = req.query as Record<string, string | undefined>;
         const [tasksSnapshot, leadsSnapshot, usersSnapshot] = await Promise.all([
-            mongoStore.ref(TASKS_PATH).once("value"),
-            mongoStore.ref(LEADS_PATH).once("value"),
-            mongoStore.ref("users").once("value"),
+            rtdb.ref(TASKS_PATH).once("value"),
+            rtdb.ref(LEADS_PATH).once("value"),
+            rtdb.ref("users").once("value"),
         ]);
 
         const tasks = tasksSnapshot.val() || {};
@@ -527,11 +438,7 @@ export const getTasks = async (req: AuthRequest, res: Response) => {
         let items = Object.entries(tasks).map(([id, task]: [string, any]) => ({ ...task, id }));
 
         if (!USER_ROLES_WITH_GLOBAL_TASK_ACCESS.has(req.user!.role)) {
-            items = items.filter((task: any) => {
-                if (taskHasAssignee(task, req.user!.id) || task.createdBy === req.user!.id) return true;
-                if (task.leadId && leads[task.leadId] && canUserAccessLead(leads[task.leadId], req.user)) return true;
-                return false;
-            });
+            items = items.filter((task: any) => taskHasAssignee(task, req.user!.id) || task.createdBy === req.user!.id);
         } else if (assignedTo) {
             items = items.filter((task: any) => taskHasAssignee(task, assignedTo));
         }
@@ -563,13 +470,13 @@ export const getTasks = async (req: AuthRequest, res: Response) => {
 
         res.status(200).json({ success: true, count: data.length, data });
     } catch (error: any) {
-        handleControllerError(res, error, "Failed to fetch tasks");
+        res.status(500).json({ success: false, message: error.message });
     }
 };
 
 export const getMeetingById = async (req: AuthRequest, res: Response) => {
     try {
-        const meetingSnapshot = await mongoStore.ref(`${MEETINGS_PATH}/${req.params.id}`).once("value");
+        const meetingSnapshot = await rtdb.ref(`${MEETINGS_PATH}/${req.params.id}`).once("value");
         const meeting = meetingSnapshot.val();
 
         if (!meeting) {
@@ -577,13 +484,12 @@ export const getMeetingById = async (req: AuthRequest, res: Response) => {
             return;
         }
 
-        const lead = meeting.leadId ? await fetchLeadById(meeting.leadId) : null;
-        if (!canAccessMeeting(req.user, meeting, lead)) {
+        if (!canAccessMeeting(req.user, meeting)) {
             res.status(403).json({ success: false, message: "Not authorized to access this meeting" });
             return;
         }
 
-        const leadsSnapshot = await mongoStore.ref(LEADS_PATH).once("value");
+        const leadsSnapshot = await rtdb.ref(LEADS_PATH).once("value");
         const leads = leadsSnapshot.val() || {};
 
         res.status(200).json({
@@ -591,14 +497,14 @@ export const getMeetingById = async (req: AuthRequest, res: Response) => {
             data: buildMeetingResponse({ ...meeting, id: meetingSnapshot.key }, leads),
         });
     } catch (error: any) {
-        handleControllerError(res, error, "Failed to fetch meeting");
+        res.status(500).json({ success: false, message: error.message });
     }
 };
 
 export const updateTask = async (req: AuthRequest, res: Response) => {
     try {
         const { id } = req.params;
-        const taskRef = mongoStore.ref(`${TASKS_PATH}/${id}`);
+        const taskRef = rtdb.ref(`${TASKS_PATH}/${id}`);
         const snapshot = await taskRef.once("value");
         const existingTask = snapshot.val();
 
@@ -607,8 +513,7 @@ export const updateTask = async (req: AuthRequest, res: Response) => {
             return;
         }
 
-        const existingLead = existingTask.leadId ? await fetchLeadById(existingTask.leadId) : null;
-        if (!canAccessTask(req.user, existingTask, existingLead)) {
+        if (!canAccessTask(req.user, existingTask)) {
             res.status(403).json({ success: false, message: "Not authorized to update this task" });
             return;
         }
@@ -629,21 +534,8 @@ export const updateTask = async (req: AuthRequest, res: Response) => {
         }
 
         if (req.body.dueDate !== undefined) {
-            let dueDate: number | undefined;
-            if (typeof req.body.dueDate === "number" && Number.isFinite(req.body.dueDate) && req.body.dueDate > 0) {
-                dueDate = req.body.dueDate;
-            } else if (typeof req.body.dueDate === "string" && req.body.dueDate.trim()) {
-                const num = Number(req.body.dueDate);
-                if (Number.isFinite(num) && num > 0) {
-                    dueDate = num;
-                } else {
-                    const parsed = new Date(req.body.dueDate).getTime();
-                    if (Number.isFinite(parsed) && parsed > 0) {
-                        dueDate = parsed;
-                    }
-                }
-            }
-            if (!dueDate) {
+            const dueDate = Number(req.body.dueDate);
+            if (!Number.isFinite(dueDate)) {
                 res.status(400).json({ success: false, message: "Valid due date is required" });
                 return;
             }
@@ -677,22 +569,14 @@ export const updateTask = async (req: AuthRequest, res: Response) => {
         }
 
         if (req.body.leadId !== undefined) {
-            const rawLeadId = String(req.body.leadId || "").trim();
-            if (rawLeadId && rawLeadId !== "null" && rawLeadId !== "undefined" && rawLeadId !== "none") {
-                if (!Types.ObjectId.isValid(rawLeadId)) {
-                    res.status(404).json({ success: false, message: "Associated lead not found" });
-                    return;
-                }
-                const lead = await fetchLeadById(rawLeadId);
+            const leadId = String(req.body.leadId || "").trim();
+            if (leadId) {
+                const lead = await fetchLeadById(leadId);
                 if (!lead) {
-                    res.status(404).json({ success: false, message: "Associated lead not found" });
+                    res.status(404).json({ success: false, message: "Lead not found" });
                     return;
                 }
-                if (!canUserAccessLead(lead, req.user)) {
-                    res.status(403).json({ success: false, message: "Not authorized to link this lead" });
-                    return;
-                }
-                updates.leadId = rawLeadId;
+                updates.leadId = leadId;
             } else {
                 updates.leadId = null;
             }
@@ -711,17 +595,14 @@ export const updateTask = async (req: AuthRequest, res: Response) => {
             }
 
             const assignedUsers = await Promise.all(
-                assignedTo.map(async (assigneeId) => {
-                    const user = await fetchUserById(assigneeId);
-                    if (!user && assigneeId === req.user!.id) {
-                        return { assigneeId, user: { _id: req.user!.id, role: req.user!.role, name: req.user!.email } };
-                    }
-                    return { assigneeId, user };
-                })
+                assignedTo.map(async (assigneeId) => ({
+                    assigneeId,
+                    user: await fetchUserById(assigneeId),
+                }))
             );
             const missingAssignee = assignedUsers.find((assignee) => !assignee.user);
             if (missingAssignee) {
-                res.status(404).json({ success: false, message: `Assigned user not found: ${missingAssignee.assigneeId}`, error: `Assigned user not found: ${missingAssignee.assigneeId}` });
+                res.status(404).json({ success: false, message: `Assigned user not found: ${missingAssignee.assigneeId}` });
                 return;
             }
 
@@ -729,7 +610,7 @@ export const updateTask = async (req: AuthRequest, res: Response) => {
                 (assignee) => !GLOBAL_TASK_ASSIGNABLE_ROLES.has(String(assignee.user?.role || ""))
             );
             if (invalidAssignee) {
-                res.status(400).json({ success: false, message: "Tasks can only be assigned to admins, managers, or sales reps", error: "Tasks can only be assigned to admins, managers, or sales reps" });
+                res.status(400).json({ success: false, message: "Tasks can only be assigned to sales reps or managers" });
                 return;
             }
 
@@ -749,8 +630,8 @@ export const updateTask = async (req: AuthRequest, res: Response) => {
 
         const [tasksSnapshot, leadsSnapshot, usersSnapshot] = await Promise.all([
             taskRef.once("value"),
-            mongoStore.ref(LEADS_PATH).once("value"),
-            mongoStore.ref("users").once("value"),
+            rtdb.ref(LEADS_PATH).once("value"),
+            rtdb.ref("users").once("value"),
         ]);
 
         res.status(200).json({
@@ -758,14 +639,14 @@ export const updateTask = async (req: AuthRequest, res: Response) => {
             data: buildTaskResponse({ ...tasksSnapshot.val(), id }, leadsSnapshot.val() || {}, usersSnapshot.val() || {}),
         });
     } catch (error: any) {
-        handleControllerError(res, error, "Failed to update task");
+        res.status(500).json({ success: false, message: error.message });
     }
 };
 
 export const updateMeeting = async (req: AuthRequest, res: Response) => {
     try {
         const { id } = req.params as { id: string };
-        const meetingRef = mongoStore.ref(`${MEETINGS_PATH}/${id}`);
+        const meetingRef = rtdb.ref(`${MEETINGS_PATH}/${id}`);
         const snapshot = await meetingRef.once("value");
         const existingMeeting = snapshot.val();
 
@@ -774,8 +655,7 @@ export const updateMeeting = async (req: AuthRequest, res: Response) => {
             return;
         }
 
-        const existingLead = existingMeeting.leadId ? await fetchLeadById(existingMeeting.leadId) : null;
-        if (!canAccessMeeting(req.user, existingMeeting, existingLead)) {
+        if (!canAccessMeeting(req.user, existingMeeting)) {
             res.status(403).json({ success: false, message: "Not authorized to update this meeting" });
             return;
         }
@@ -794,22 +674,12 @@ export const updateMeeting = async (req: AuthRequest, res: Response) => {
         }
 
         let attendees = parsed.data.attendees ?? normalizeAttendees(existingMeeting.attendees);
-        let lead: any = null;
-        const nextLeadId = parsed.data.leadId !== undefined ? parsed.data.leadId : existingMeeting.leadId;
-        if (nextLeadId) {
-            if (!Types.ObjectId.isValid(nextLeadId)) {
-                res.status(404).json({ success: false, message: "Associated lead not found for this meeting" });
-                return;
-            }
-            lead = await fetchLeadById(nextLeadId);
-            if (!lead) {
-                res.status(404).json({ success: false, message: "Associated lead not found for this meeting" });
-                return;
-            }
-            if (!canUserAccessLead(lead, req.user)) {
-                res.status(403).json({ success: false, message: "Not authorized for this lead" });
-                return;
-            }
+        const nextLeadId = parsed.data.leadId ?? existingMeeting.leadId;
+        const lead = await fetchLeadById(nextLeadId);
+
+        if (!lead) {
+            res.status(404).json({ success: false, message: "Lead not found for this meeting" });
+            return;
         }
 
         attendees = attachDefaultMeetingAttendees(attendees, lead, req.user);
@@ -829,7 +699,7 @@ export const updateMeeting = async (req: AuthRequest, res: Response) => {
         const refreshedMeeting = await fetchMeetingWithLead(id);
         res.status(200).json({ success: true, data: refreshedMeeting });
     } catch (error: any) {
-        handleControllerError(res, error, "Failed to update meeting");
+        res.status(500).json({ success: false, message: error.message });
     }
 };
 
@@ -842,36 +712,24 @@ export const scheduleMeeting = async (req: AuthRequest, res: Response) => {
         }
 
         const userId = req.user!.id;
-        let lead: any = null;
-        if (parsed.data.leadId) {
-            if (!Types.ObjectId.isValid(parsed.data.leadId)) {
-                res.status(404).json({ success: false, message: "Associated lead not found" });
-                return;
-            }
-            lead = await fetchLeadById(parsed.data.leadId);
-            if (!lead) {
-                res.status(404).json({ success: false, message: "Associated lead not found" });
-                return;
-            }
-            if (!canUserAccessLead(lead, req.user)) {
-                res.status(403).json({ success: false, message: "Not authorized to schedule activities for this lead" });
-                return;
-            }
+        const lead = await fetchLeadById(parsed.data.leadId!);
+
+        if (!lead) {
+            res.status(404).json({ success: false, message: "Lead not found" });
+            return;
         }
 
-        const meetingRef = mongoStore.ref(MEETINGS_PATH).push();
+        const meetingRef = rtdb.ref(MEETINGS_PATH).push();
         const attendees = attachDefaultMeetingAttendees(parsed.data.attendees || [], lead, req.user);
-        const isGoogleMeet = parsed.data.meetingMode === "google_meet" || req.body.createGoogleMeeting === true;
-        const meetingMode = isGoogleMeet ? "google_meet" : (parsed.data.meetingMode || "other");
         const meetingData: IMeeting = {
             id: meetingRef.key!,
             subject: parsed.data.subject!,
-            meetingMode,
+            meetingMode: parsed.data.meetingMode || "google_meet",
             startTime: parsed.data.startTime!,
             endTime: parsed.data.endTime!,
             status: parsed.data.status || "Scheduled",
             assignedTo: userId,
-            leadId: parsed.data.leadId || "",
+            leadId: parsed.data.leadId!,
             createdBy: userId,
             attendees,
             syncStatus: "pending",
@@ -884,67 +742,33 @@ export const scheduleMeeting = async (req: AuthRequest, res: Response) => {
         if (parsed.data.agenda) meetingData.agenda = parsed.data.agenda;
         if (parsed.data.location) meetingData.location = parsed.data.location;
 
-        if (meetingMode === "google_meet") {
-            const meetCode = `sec-${meetingRef.key?.toLowerCase().slice(-3) || "crm"}-${Date.now().toString(36).slice(-4)}`;
-            meetingData.meetLink = parsed.data.meetLink || `https://meet.google.com/${meetCode}`;
-        }
-
         await meetingRef.set(meetingData);
-        try {
-            await MeetingGoogleSyncService.syncMeeting(meetingData.id!);
-        } catch {
-            // sync error is logged on the meeting record
-        }
-        if (meetingData.leadId) {
-            const isCall = meetingMode === "phone";
-            await addLeadTimelineEntry(
-                meetingData.leadId,
-                isCall ? `Call scheduled: ${meetingData.subject}` : `Meeting scheduled: ${meetingData.subject}`,
-                userId,
-                isCall ? "Call Scheduled" : "Meeting Scheduled"
-            );
-        }
+        await MeetingGoogleSyncService.syncMeeting(meetingData.id!);
+        await addLeadTimelineEntry(meetingData.leadId, `Meeting scheduled: ${meetingData.subject}`, userId);
 
         const refreshedMeeting = await fetchMeetingWithLead(meetingData.id!);
         res.status(201).json({ success: true, data: refreshedMeeting });
     } catch (error: any) {
-        handleControllerError(res, error, "Failed to schedule meeting or call");
+        res.status(500).json({ success: false, message: error.message });
     }
 };
 
 export const createTask = async (req: AuthRequest, res: Response) => {
     try {
-        const { leadId, subject, title, dueDate, priority, status, description } = req.body;
+        const { leadId, subject, dueDate, priority, status, description } = req.body;
         const userId = req.user!.id;
         const userRole = req.user!.role;
-        const trimmedSubject = String(subject ?? title ?? "").trim();
+        const trimmedSubject = String(subject || "").trim();
 
         if (!trimmedSubject) {
             res.status(400).json({ success: false, message: "Task subject is required" });
             return;
         }
 
-        let normalizedDueDate: number;
-        if (typeof dueDate === "number" && Number.isFinite(dueDate) && dueDate > 0) {
-            normalizedDueDate = dueDate;
-        } else if (typeof dueDate === "string" && dueDate.trim()) {
-            const num = Number(dueDate);
-            if (Number.isFinite(num) && num > 0) {
-                normalizedDueDate = num;
-            } else {
-                const parsed = new Date(dueDate).getTime();
-                if (Number.isFinite(parsed) && parsed > 0) {
-                    normalizedDueDate = parsed;
-                } else {
-                    const d = new Date();
-                    d.setHours(23, 59, 59, 999);
-                    normalizedDueDate = d.getTime();
-                }
-            }
-        } else {
-            const d = new Date();
-            d.setHours(23, 59, 59, 999);
-            normalizedDueDate = d.getTime();
+        const normalizedDueDate = Number(dueDate);
+        if (!Number.isFinite(normalizedDueDate)) {
+            res.status(400).json({ success: false, message: "Valid due date is required" });
+            return;
         }
 
         const normalizedPriority = priority || "Medium";
@@ -960,65 +784,56 @@ export const createTask = async (req: AuthRequest, res: Response) => {
         }
 
         let assignedTo = [userId];
-        if (req.body.assignedTo !== undefined && req.body.assignedTo !== null) {
+        if (req.body.assignedTo !== undefined) {
             const requestedAssignees = normalizeTaskAssigneeIds(req.body.assignedTo);
 
-            if (requestedAssignees.length > 0) {
-                if (
-                    !USER_ROLES_WITH_GLOBAL_TASK_ACCESS.has(userRole) &&
-                    (requestedAssignees.length !== 1 || requestedAssignees[0] !== userId)
-                ) {
-                    res.status(403).json({ success: false, message: "Sales reps can only create tasks for themselves" });
-                    return;
-                }
-
-                const assignedUsers = await Promise.all(
-                    requestedAssignees.map(async (assigneeId) => {
-                        const user = await fetchUserById(assigneeId);
-                        if (!user && assigneeId === userId) {
-                            return { assigneeId, user: { _id: userId, role: userRole, name: req.user!.email } };
-                        }
-                        return { assigneeId, user };
-                    })
-                );
-                const missingAssignee = assignedUsers.find((assignee) => !assignee.user);
-                if (missingAssignee) {
-                    res.status(404).json({ success: false, message: `Assigned user not found: ${missingAssignee.assigneeId}`, error: `Assigned user not found: ${missingAssignee.assigneeId}` });
-                    return;
-                }
-
-                if (
-                    USER_ROLES_WITH_GLOBAL_TASK_ACCESS.has(userRole) &&
-                    assignedUsers.some((assignee) => !GLOBAL_TASK_ASSIGNABLE_ROLES.has(String(assignee.user?.role || "")))
-                ) {
-                    res.status(400).json({ success: false, message: "Tasks can only be assigned to admins, managers, or sales reps", error: "Tasks can only be assigned to admins, managers, or sales reps" });
-                    return;
-                }
-
-                assignedTo = requestedAssignees;
-            }
-        }
-
-        let normalizedLeadId: string | undefined = undefined;
-        const rawLeadId = String(leadId || "").trim();
-        if (rawLeadId && rawLeadId !== "null" && rawLeadId !== "undefined" && rawLeadId !== "none") {
-            if (!Types.ObjectId.isValid(rawLeadId)) {
-                res.status(404).json({ success: false, message: "Associated lead not found" });
+            if (!requestedAssignees.length) {
+                res.status(400).json({ success: false, message: "At least one assignee is required" });
                 return;
             }
-            const lead = await fetchLeadById(rawLeadId);
+
+            if (
+                !USER_ROLES_WITH_GLOBAL_TASK_ACCESS.has(userRole) &&
+                (requestedAssignees.length !== 1 || requestedAssignees[0] !== userId)
+            ) {
+                res.status(403).json({ success: false, message: "Sales reps can only create tasks for themselves" });
+                return;
+            }
+
+            const assignedUsers = await Promise.all(
+                requestedAssignees.map(async (assigneeId) => ({
+                    assigneeId,
+                    user: await fetchUserById(assigneeId),
+                }))
+            );
+            const missingAssignee = assignedUsers.find((assignee) => !assignee.user);
+            if (missingAssignee) {
+                res.status(404).json({ success: false, message: `Assigned user not found: ${missingAssignee.assigneeId}` });
+                return;
+            }
+
+            if (
+                USER_ROLES_WITH_GLOBAL_TASK_ACCESS.has(userRole) &&
+                assignedUsers.some((assignee) => !GLOBAL_TASK_ASSIGNABLE_ROLES.has(String(assignee.user?.role || "")))
+            ) {
+                res.status(400).json({ success: false, message: "Tasks can only be assigned to sales reps or managers" });
+                return;
+            }
+
+            assignedTo = requestedAssignees;
+        }
+
+        let normalizedLeadId: string | undefined;
+        if (leadId) {
+            normalizedLeadId = String(leadId).trim();
+            const lead = await fetchLeadById(normalizedLeadId);
             if (!lead) {
-                res.status(404).json({ success: false, message: "Associated lead not found" });
+                res.status(404).json({ success: false, message: "Lead not found" });
                 return;
             }
-            if (!canUserAccessLead(lead, req.user)) {
-                res.status(403).json({ success: false, message: "Not authorized to create tasks for this lead" });
-                return;
-            }
-            normalizedLeadId = rawLeadId;
         }
 
-        const taskRef = mongoStore.ref(TASKS_PATH).push();
+        const taskRef = rtdb.ref(TASKS_PATH).push();
         const source = resolveTaskSource(userRole, userId, assignedTo);
         const taskData: ITask = {
             id: taskRef.key,
@@ -1040,17 +855,25 @@ export const createTask = async (req: AuthRequest, res: Response) => {
         await taskRef.set(taskData);
 
         if (normalizedLeadId) {
-            await addLeadTimelineEntry(
-                normalizedLeadId,
-                `Task created: ${trimmedSubject}`,
-                userId,
-                "Task Created"
-            );
+            const leadRef = rtdb.ref(`${LEADS_PATH}/${normalizedLeadId}`);
+            const leadSnap = await leadRef.once("value");
+            const lead = leadSnap.val();
+
+            if (lead) {
+                const timeline = lead.timeline || [];
+                timeline.push({
+                    event: "Status Changed",
+                    remark: `Task created: ${trimmedSubject}`,
+                    performedBy: userId,
+                    timestamp: Date.now(),
+                });
+                await leadRef.update({ timeline });
+            }
         }
 
         const [leadsSnapshot, usersSnapshot] = await Promise.all([
-            mongoStore.ref(LEADS_PATH).once("value"),
-            mongoStore.ref("users").once("value"),
+            rtdb.ref(LEADS_PATH).once("value"),
+            rtdb.ref("users").once("value"),
         ]);
 
         res.status(201).json({
@@ -1058,14 +881,14 @@ export const createTask = async (req: AuthRequest, res: Response) => {
             data: buildTaskResponse(taskData, leadsSnapshot.val() || {}, usersSnapshot.val() || {}),
         });
     } catch (error: any) {
-        handleControllerError(res, error, "Failed to create task");
+        res.status(500).json({ success: false, message: error.message });
     }
 };
 
 export const deleteMeeting = async (req: AuthRequest, res: Response) => {
     try {
         const { id } = req.params;
-        const meetingRef = mongoStore.ref(`${MEETINGS_PATH}/${id}`);
+        const meetingRef = rtdb.ref(`${MEETINGS_PATH}/${id}`);
         const snapshot = await meetingRef.once("value");
         const meeting = snapshot.val();
 
@@ -1074,8 +897,7 @@ export const deleteMeeting = async (req: AuthRequest, res: Response) => {
             return;
         }
 
-        const lead = meeting.leadId ? await fetchLeadById(meeting.leadId) : null;
-        if (!canAccessMeeting(req.user, meeting, lead)) {
+        if (!canAccessMeeting(req.user, meeting)) {
             res.status(403).json({ success: false, message: "Not authorized to delete this meeting" });
             return;
         }
@@ -1085,14 +907,14 @@ export const deleteMeeting = async (req: AuthRequest, res: Response) => {
 
         res.status(200).json({ success: true, message: "Meeting deleted successfully" });
     } catch (error: any) {
-        handleControllerError(res, error, "Failed to delete meeting");
+        res.status(500).json({ success: false, message: error.message });
     }
 };
 
 export const deleteTask = async (req: AuthRequest, res: Response) => {
     try {
         const { id } = req.params;
-        const taskRef = mongoStore.ref(`${TASKS_PATH}/${id}`);
+        const taskRef = rtdb.ref(`${TASKS_PATH}/${id}`);
         const snapshot = await taskRef.once("value");
         const task = snapshot.val();
 
@@ -1101,8 +923,7 @@ export const deleteTask = async (req: AuthRequest, res: Response) => {
             return;
         }
 
-        const lead = task.leadId ? await fetchLeadById(task.leadId) : null;
-        if (!canDeleteTask(req.user, task, lead)) {
+        if (!canDeleteTask(req.user, task)) {
             res.status(403).json({ success: false, message: "Not authorized to delete this task" });
             return;
         }
@@ -1110,6 +931,6 @@ export const deleteTask = async (req: AuthRequest, res: Response) => {
         await taskRef.remove();
         res.status(200).json({ success: true, message: "Task deleted successfully" });
     } catch (error: any) {
-        handleControllerError(res, error, "Failed to delete task");
+        res.status(500).json({ success: false, message: error.message });
     }
 };

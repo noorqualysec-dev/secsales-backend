@@ -1,12 +1,9 @@
 import type { Response } from "express";
-import bcrypt from "bcrypt";
-import { mongoStore } from "../config/mongoCompat.js";
-import { AuditEvent, NegotiationEvent, Proposal, User } from "../models/mongoModels.js";
-import { proposalResponse } from "./proposalController.js";
-import { getNextLeadReminderAt } from "../services/reminderPolicy.js";
+import { rtdb } from "../config/firebase.js";
 import type { AuthRequest } from "../middleware/authMiddleware.js";
 import { LEAD_STATUSES, normalizeLeadStatus } from "../models/leadModel.js";
 import type { ILead, LeadOutcome, LeadStatus } from "../models/leadModel.js";
+import { syncProposalsFromLeadTransition } from "../utils/proposalSync.js";
 
 const USERS_PATH = "users";
 const LEADS_PATH = "leads";
@@ -19,56 +16,6 @@ const OPEN_PIPELINE_STATUSES = new Set<string>([
 ]);
 const normalizeTestingScope = (value: unknown): string[] =>
     Array.isArray(value) ? value.filter((scope): scope is string => typeof scope === "string") : [];
-
-export const provisionUser = async (req: AuthRequest, res: Response) => {
-    try {
-        if (req.user?.role !== "admin") {
-            res.status(403).json({ success: false, message: "Only an admin can provision users" });
-            return;
-        }
-        const name = String(req.body.name ?? "").trim();
-        const email = String(req.body.email ?? "").trim().toLowerCase();
-        const password = req.body.password;
-        const role = req.body.role ?? "sales_rep";
-        if (!name || !email || typeof password !== "string" || password.length < 6) {
-            res.status(400).json({ success: false, message: "Name, email, and a password of at least 6 characters are required" });
-            return;
-        }
-        if (!["admin", "manager", "sales_rep"].includes(role)) {
-            res.status(400).json({ success: false, message: "Invalid role" });
-            return;
-        }
-        const passwordHash = await bcrypt.hash(password, 12);
-        const user = await User.create({
-            name,
-            email,
-            passwordHash,
-            role,
-            isActive: true,
-            activatedAt: new Date(),
-        });
-        await AuditEvent.create({
-            entityType: "user",
-            entityId: user._id,
-            eventType: "user.provisioned",
-            actorId: req.user.id,
-            occurredAt: new Date(),
-            meaningfulActivity: false,
-            changes: [{ field: "role", after: role }],
-        });
-        res.status(201).json({
-            success: true,
-            data: { _id: user._id, name: user.name, email: user.email, role: user.role, isActive: user.isActive },
-        });
-    } catch (error) {
-        if ((error as { code?: number }).code === 11000) {
-            res.status(409).json({ success: false, message: "A user with that email already exists" });
-            return;
-        }
-        console.error("User provisioning failed:", error);
-        res.status(500).json({ success: false, message: "User provisioning failed" });
-    }
-};
 
 const getLeadOutcome = (lead: Partial<ILead>): LeadOutcome => {
     if (lead.outcome === "won" || lead.outcome === "lost" || lead.outcome === "cancelled") {
@@ -107,7 +54,7 @@ const normalizeLeadStatusFields = <T extends Partial<ILead>>(lead: T): T => {
 // Helper for manual "population"
 const populateRef = async (path: string, id: string, fields: string[]) => {
     if (!id) return null;
-    const snapshot = await mongoStore.ref(`${path}/${id}`).once("value");
+    const snapshot = await rtdb.ref(`${path}/${id}`).once("value");
     if (!snapshot.exists()) return null;
     const data = snapshot.val();
     const result: any = { _id: snapshot.key };
@@ -119,7 +66,7 @@ const populateRef = async (path: string, id: string, fields: string[]) => {
 
 export const getAllUsers = async (req: AuthRequest, res: Response) => {
     try {
-        const snapshot = await mongoStore.ref(USERS_PATH).once("value");
+        const snapshot = await rtdb.ref(USERS_PATH).once("value");
         if (!snapshot.exists()) {
             res.status(200).json({ success: true, count: 0, data: [] });
             return;
@@ -167,7 +114,7 @@ export const updateUserRole = async (req: AuthRequest, res: Response) => {
             return;
         }
 
-        const userRef = mongoStore.ref(`${USERS_PATH}/${id}`);
+        const userRef = rtdb.ref(`${USERS_PATH}/${id}`);
         const snapshot = await userRef.once("value");
 
         if (!snapshot.exists()) {
@@ -189,7 +136,7 @@ export const updateUserRole = async (req: AuthRequest, res: Response) => {
 export const toggleUserStatus = async (req: AuthRequest, res: Response) => {
     try {
         const id = req.params.id as string;
-        const userRef = mongoStore.ref(`${USERS_PATH}/${id}`);
+        const userRef = rtdb.ref(`${USERS_PATH}/${id}`);
         const snapshot = await userRef.once("value");
 
         if (!snapshot.exists()) {
@@ -221,7 +168,7 @@ export const toggleUserStatus = async (req: AuthRequest, res: Response) => {
 export const getAllLeads = async (req: AuthRequest, res: Response) => {
     try {
         const statusFilterRaw = typeof req.query.status === "string" ? req.query.status.trim() : "";
-        const snapshot = await mongoStore.ref(LEADS_PATH).once("value");
+        const snapshot = await rtdb.ref(LEADS_PATH).once("value");
 
         if (!snapshot.exists()) {
             res.status(200).json({ success: true, count: 0, data: [] });
@@ -276,7 +223,7 @@ export const assignLead = async (req: AuthRequest, res: Response) => {
             return;
         }
 
-        const leadRef = mongoStore.ref(`${LEADS_PATH}/${id}`);
+        const leadRef = rtdb.ref(`${LEADS_PATH}/${id}`);
         const leadSnapshot = await leadRef.once("value");
 
         if (!leadSnapshot.exists()) {
@@ -284,7 +231,7 @@ export const assignLead = async (req: AuthRequest, res: Response) => {
             return;
         }
 
-        const userSnapshot = await mongoStore.ref(`${USERS_PATH}/${assignedTo}`).once("value");
+        const userSnapshot = await rtdb.ref(`${USERS_PATH}/${assignedTo}`).once("value");
         if (!userSnapshot.exists()) {
             res.status(404).json({ success: false, message: "Target user not found" });
             return;
@@ -301,16 +248,7 @@ export const assignLead = async (req: AuthRequest, res: Response) => {
             timestamp: Date.now()
         });
 
-        const reassignedAt = Date.now();
-        const nextReminder = leadData.outcome === "open"
-            ? await getNextLeadReminderAt(getLeadStage(leadData), new Date(reassignedAt))
-            : null;
-        await leadRef.update({
-            assignedTo,
-            timeline,
-            updatedAt: reassignedAt,
-            ...(nextReminder ? { nextReminderDueAt: nextReminder.getTime() } : { nextReminderDueAt: null }),
-        });
+        await leadRef.update({ assignedTo, timeline, updatedAt: Date.now() });
 
         res.status(200).json({ success: true, message: `Lead assigned to ${targetUser?.name}` });
     } catch (error: any) {
@@ -320,7 +258,7 @@ export const assignLead = async (req: AuthRequest, res: Response) => {
 
 export const updateLeadStatus = async (req: AuthRequest, res: Response) => {
     try {
-        const { status, outcome, lostReason, wonReason, latestRemark, cancellationReason } = req.body;
+        const { status, outcome, lostReason, wonReason, latestRemark } = req.body;
         const id = req.params.id as string;
 
         if (!status && !outcome) {
@@ -328,7 +266,7 @@ export const updateLeadStatus = async (req: AuthRequest, res: Response) => {
             return;
         }
 
-        const leadRef = mongoStore.ref(`${LEADS_PATH}/${id}`);
+        const leadRef = rtdb.ref(`${LEADS_PATH}/${id}`);
         const snapshot = await leadRef.once("value");
 
         if (!snapshot.exists()) {
@@ -359,32 +297,6 @@ export const updateLeadStatus = async (req: AuthRequest, res: Response) => {
                 return;
             }
         }
-        if (
-            requestedStatus &&
-            OPEN_PIPELINE_STATUSES.has(requestedStatus) &&
-            nextStatus === "Proposal Sent" &&
-            oldStatus !== "Proposal Sent" &&
-            !(await Proposal.exists({ leadId: id }))
-        ) {
-            res.status(409).json({
-                success: false,
-                message: "A proposal is mandatory before moving this lead to Proposal Sent. Please create a proposal first.",
-            });
-            return;
-        }
-        if (
-            requestedStatus &&
-            OPEN_PIPELINE_STATUSES.has(requestedStatus) &&
-            nextStatus === "Negotiation" &&
-            oldStatus !== "Negotiation" &&
-            !(await Proposal.exists({ leadId: id }))
-        ) {
-            res.status(409).json({
-                success: false,
-                message: "A proposal is required before moving this lead to Negotiation.",
-            });
-            return;
-        }
 
         if (requestedOutcome) {
             if (!["open", "won", "lost", "cancelled"].includes(requestedOutcome)) {
@@ -394,72 +306,15 @@ export const updateLeadStatus = async (req: AuthRequest, res: Response) => {
             nextOutcome = requestedOutcome as LeadOutcome;
         }
 
-        if (nextOutcome === "lost" && !String(lostReason ?? "").trim()) {
-            res.status(400).json({ success: false, message: "Loss reason is required when marking lead as lost" });
+        if (nextOutcome === "lost" && !String(lostReason ?? "").trim() && req.user.role === "sales_rep") {
+            res.status(400).json({ success: false, message: "Loss note is required when marking lead as lost" });
             return;
         }
-        if (nextOutcome === "cancelled" && !String(req.body.cancellationReason ?? "").trim()) {
-            res.status(400).json({ success: false, message: "Cancellation reason is required when cancelling a lead" });
-            return;
-        }
-        if (nextOutcome === "won" && oldOutcome !== "won") {
-            if (!["Proposal Sent", "Negotiation"].includes(oldStatus) && !["Proposal Sent", "Negotiation"].includes(nextStatus)) {
-                res.status(409).json({ success: false, message: "A lead cannot be marked as Won unless it is in the Proposal Sent or Negotiation stage." });
-                return;
-            }
-            if (!(await Proposal.exists({ leadId: id, status: { $in: ["Won", "Accepted"] } }))) {
-                res.status(409).json({ success: false, message: "A lead can be marked won only after its proposal is accepted" });
-                return;
-            }
-        }
 
-        if (nextStatus === "Proposal Sent" && oldStatus !== "Proposal Sent") {
-            const existingProposal = await Proposal.findOne({ leadId: id });
-            if (existingProposal && existingProposal.status === "Draft") {
-                existingProposal.status = "Proposal Sent";
-                await existingProposal.save();
-                await NegotiationEvent.create([{
-                    proposalId: existingProposal._id,
-                    leadId: id,
-                    ...(existingProposal.currentRevisionId ? { revisionId: existingProposal.currentRevisionId } : {}),
-                    type: "Proposal Sent",
-                    fromStatus: "Draft",
-                    toStatus: "Proposal Sent",
-                    occurredAt: new Date(now),
-                    actorId: req.user!.id,
-                    note: "Proposal moved to Proposal Sent as lead moved to Proposal Sent stage via Admin",
-                }]);
-            }
-        }
-
-        if (nextStatus === "Negotiation" && oldStatus !== "Negotiation") {
-            const existingProposal = await Proposal.findOne({ leadId: id });
-            if (existingProposal && !["Negotiation", "Won", "Revision", "In Negotiation", "Accepted"].includes(existingProposal.status)) {
-                const prevStatus = existingProposal.status;
-                existingProposal.status = "Negotiation";
-                await existingProposal.save();
-                await NegotiationEvent.create([{
-                    proposalId: existingProposal._id,
-                    leadId: id,
-                    ...(existingProposal.currentRevisionId ? { revisionId: existingProposal.currentRevisionId } : {}),
-                    type: "Negotiation",
-                    fromStatus: prevStatus,
-                    toStatus: "Negotiation",
-                    occurredAt: new Date(now),
-                    actorId: req.user!.id,
-                    note: "Lead moved to Negotiation stage via Admin",
-                }]);
-            }
-        }
-
-        if (nextOutcome !== "open") {
-            const closureReason = String(
-                nextOutcome === "won" ? (wonReason ?? "")
-                    : nextOutcome === "lost" ? (lostReason ?? "")
-                        : (cancellationReason ?? ""),
-            ).trim();
+        if (nextOutcome === "won" || nextOutcome === "lost") {
+            const closureReason = String(nextOutcome === "won" ? (wonReason ?? "") : (lostReason ?? "")).trim();
             const closureEvent: any = {
-                event: nextOutcome === "won" ? "Won" : nextOutcome === "lost" ? "Lost" : "Cancelled",
+                event: nextOutcome === "won" ? "Won" : "Lost",
                 status: nextStatus,
                 previousStatus: oldStatus,
                 outcome: nextOutcome,
@@ -477,24 +332,18 @@ export const updateLeadStatus = async (req: AuthRequest, res: Response) => {
             if (nextOutcome === "won") {
                 updates.wonAtStatus = nextStatus;
                 updates.lostAtStatus = null as any;
-                updates.cancellationReason = null as any;
                 updates.wasEverWon = true;
                 const normalizedWonReason = String(wonReason ?? "").trim();
                 if (normalizedWonReason) {
                     updates.wonReason = normalizedWonReason;
                 }
-            } else if (nextOutcome === "lost") {
+            } else {
                 updates.lostAtStatus = nextStatus;
                 updates.wonAtStatus = null as any;
-                updates.cancellationReason = null as any;
                 const normalizedLostReason = String(lostReason ?? "").trim();
                 if (normalizedLostReason) {
                     updates.lostReason = normalizedLostReason;
                 }
-            } else {
-                updates.wonAtStatus = null as any;
-                updates.lostAtStatus = null as any;
-                updates.cancellationReason = closureReason;
             }
         } else if (nextStatus !== oldStatus || oldOutcome !== "open") {
             timeline.push({
@@ -505,8 +354,8 @@ export const updateLeadStatus = async (req: AuthRequest, res: Response) => {
                 performedBy: req.user!.id,
                 remark: String(latestRemark ?? "").trim() || (
                     oldOutcome !== "open"
-                        ? `Lead reopened and moved to ${nextStatus} via Admin`
-                        : `Stage changed from ${oldStatus} to ${nextStatus}`
+                        ? `Lead reopened and moved to [${nextStatus}] via Admin Kanban`
+                        : `Lead moved from [${oldStatus}] to [${nextStatus}] via Admin Kanban`
                 ),
                 timestamp: now
             });
@@ -520,15 +369,26 @@ export const updateLeadStatus = async (req: AuthRequest, res: Response) => {
         if (String(latestRemark ?? "").trim()) {
             updates.latestRemark = String(latestRemark).trim();
         }
-        if (nextOutcome !== "open") {
-            updates.nextReminderDueAt = null as any;
-        } else if (nextStatus !== oldStatus || oldOutcome !== "open") {
-            const nextReminder = await getNextLeadReminderAt(nextStatus, new Date(now));
-            updates.nextReminderDueAt = (nextReminder?.getTime() ?? null) as any;
-            updates.lastActivityAt = now;
-        }
         updates.timeline = timeline;
         await leadRef.update(updates);
+
+        try {
+            const syncNote = String(latestRemark ?? "").trim();
+            await syncProposalsFromLeadTransition({
+                leadId: id,
+                previousLead: leadData,
+                nextLead: {
+                    ...leadData,
+                    ...updates,
+                    status: updates.status || nextStatus,
+                    outcome: updates.outcome || nextOutcome,
+                },
+                performedBy: req.user!.id,
+                ...(syncNote ? { note: syncNote } : {}),
+            });
+        } catch (proposalSyncError) {
+            console.error("[proposal-sync:updateLeadStatus]", proposalSyncError);
+        }
 
         res.status(200).json({ success: true, message: `Lead updated to ${nextOutcome === "open" ? nextStatus : nextOutcome}` });
     } catch (error: any) {
@@ -538,7 +398,7 @@ export const updateLeadStatus = async (req: AuthRequest, res: Response) => {
 
 export const getLeadStats = async (req: AuthRequest, res: Response) => {
     try {
-        const snapshot = await mongoStore.ref(LEADS_PATH).once("value");
+        const snapshot = await rtdb.ref(LEADS_PATH).once("value");
         if (!snapshot.exists()) {
             res.status(200).json({ success: true, data: {} });
             return;
@@ -571,9 +431,9 @@ export const getLeadStats = async (req: AuthRequest, res: Response) => {
 export const getLeadJourney = async (req: AuthRequest, res: Response) => {
     try {
         const id = req.params.id as string;
-
+        
         // 1. Get Lead
-        const leadSnapshot = await mongoStore.ref(`${LEADS_PATH}/${id}`).once("value");
+        const leadSnapshot = await rtdb.ref(`${LEADS_PATH}/${id}`).once("value");
         if (!leadSnapshot.exists()) {
             res.status(404).json({ success: false, message: "Lead not found" });
             return;
@@ -584,26 +444,14 @@ export const getLeadJourney = async (req: AuthRequest, res: Response) => {
         const assignedUser = await populateRef(USERS_PATH, leadData.assignedTo || "", ["name", "email", "role"]);
 
         // 3. Get Proposals for this lead
-        let canonicalProposal: any = null;
-        try {
-            const canonicalDoc = await Proposal.findOne({ leadId: id }).select("_id").lean();
-            if (canonicalDoc) {
-                canonicalProposal = await proposalResponse(canonicalDoc._id);
-            }
-        } catch (e) {
-            console.error("Failed to fetch canonical proposal for admin lead journey:", e);
-        }
-
-        const proposalsSnapshot = await mongoStore.ref(PROPOSALS_PATH).orderByChild("lead").equalTo(id).once("value");
+        const proposalsSnapshot = await rtdb.ref(PROPOSALS_PATH).orderByChild("lead").equalTo(id).once("value");
         const proposalsData = proposalsSnapshot.val() || {};
-        const fallbackProposals = Object.entries(proposalsData).map(([key, val]: [string, any]) => ({
+        const proposals = Object.entries(proposalsData).map(([key, val]: [string, any]) => ({
             _id: key,
             value: val.value,
             status: val.status,
             createdAt: val.createdAt
         }));
-
-        const proposals = canonicalProposal ? [canonicalProposal] : fallbackProposals;
 
         // 4. Populate Timeline PerformedBy
         const timeline = await Promise.all((leadData.timeline || []).map(async (event: any) => ({
@@ -616,8 +464,7 @@ export const getLeadJourney = async (req: AuthRequest, res: Response) => {
             data: {
                 lead: { _id: id, ...leadData, timeline },
                 assignedUser,
-                proposals,
-                proposal: canonicalProposal
+                proposals
             }
         });
     } catch (error: any) {
@@ -629,10 +476,27 @@ export const getLeadJourney = async (req: AuthRequest, res: Response) => {
 
 export const getAllProposals = async (req: AuthRequest, res: Response) => {
     try {
-        const proposalDocs = await Proposal.find().sort({ updatedAt: -1 }).select("_id").lean();
-        const fullProposals = await Promise.all(proposalDocs.map((doc) => proposalResponse(doc._id)));
-        const data = fullProposals.filter(Boolean);
-        res.status(200).json({ success: true, count: data.length, data });
+        const snapshot = await rtdb.ref(PROPOSALS_PATH).once("value");
+        if (!snapshot.exists()) {
+            res.status(200).json({ success: true, count: 0, data: [] });
+            return;
+        }
+
+        const proposalsData = snapshot.val();
+        const proposals = await Promise.all(Object.keys(proposalsData).map(async (key) => {
+            const data = proposalsData[key];
+            return {
+                _id: key,
+                ...data,
+                testingScope: normalizeTestingScope(data.testingScope),
+                lead: await populateRef(LEADS_PATH, data.lead, ["firstName", "lastName", "company", "status"]),
+                createdBy: await populateRef(USERS_PATH, data.createdBy, ["name", "email", "role"])
+            };
+        }));
+
+        proposals.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+
+        res.status(200).json({ success: true, count: proposals.length, data: proposals });
     } catch (error: any) {
         res.status(500).json({ success: false, message: error.message });
     }

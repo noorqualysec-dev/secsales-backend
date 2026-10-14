@@ -1,8 +1,5 @@
 import cron from "node-cron";
-import {
-  processLeadFollowUpReminders,
-  processTaskReminders,
-} from "../controllers/cronController.js";
+import { processLeadFollowUpReminders } from "../controllers/cronController.js";
 
 let isRunning = false;
 
@@ -12,11 +9,7 @@ export const startLeadFollowUpCron = () => {
 
     try {
       isRunning = true;
-      const [leads, tasks] = await Promise.all([
-        processLeadFollowUpReminders(),
-        processTaskReminders(),
-      ]);
-      const result = { leads, tasks };
+      const result = await processLeadFollowUpReminders();
       console.log("[lead-followup-cron]", result);
     } catch (error) {
       console.error("[lead-followup-cron]", error);

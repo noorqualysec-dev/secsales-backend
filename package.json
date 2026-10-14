@@ -5,10 +5,9 @@
   "main": "index.js",
   "scripts": {
     "build": "tsc",
-    "start": "node dist/index.js",
+    "start": "node dist/server.js",
     "dev": "npx tsx --env-file=.env src/index.ts",
-    "provision:admin": "npx tsx --env-file=.env src/scripts/provisionAdmin.ts",
-    "db:indexes": "npx tsx --env-file=.env src/scripts/createIndexes.ts"
+    "seed": "npx tsx src/scripts/seedData.ts"
   },
   "keywords": [],
   "author": "",
@@ -22,6 +21,8 @@
     "cors": "^2.8.6",
     "dotenv": "^17.3.1",
     "express": "^5.2.1",
+    "firebase": "^12.11.0",
+    "firebase-admin": "^13.7.0",
     "googleapis": "^171.4.0",
     "jsonwebtoken": "^9.0.3",
     "mongoose": "^9.3.0",

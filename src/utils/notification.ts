@@ -1,19 +1,35 @@
-import { Notification } from "../models/mongoModels.js";
+import { rtdb } from "../config/firebase.js";
+
+const NOTIFICATIONS_PATH = "notifications";
 
 interface CreateNotificationInput {
   userId: string;
-  leadId?: string;
-  taskId?: string;
+  leadId: string;
   title: string;
   message: string;
   type?: string;
-  dedupeKey?: string;
 }
 
-export const createNotification = async (input: CreateNotificationInput) => {
-  const notification = await Notification.create({
-    ...input,
+export const createNotification = async ({
+  userId,
+  leadId,
+  title,
+  message,
+  type = "lead_followup_reminder",
+}: CreateNotificationInput) => {
+  const ref = rtdb.ref(`${NOTIFICATIONS_PATH}/${userId}`).push();
+
+  const payload = {
+    type,
+    title,
+    message,
+    leadId,
     read: false,
-  });
-  return notification.toObject();
+    createdAt: Date.now(),
+    readAt: null,
+  };
+
+  await ref.set(payload);
+
+  return { id: ref.key, ...payload };
 };
